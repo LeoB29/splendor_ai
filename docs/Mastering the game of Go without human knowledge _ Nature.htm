@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html class=" yxxqqsvym idc0_350"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+    <title>Mastering the game of Go without human knowledge | 10.1038/nature24270_Sci-Hub 2025</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width">
+    <link rel="icon" href="https://sci-hub.arizonastockbroker.com/favicon.ico" type="image/x-icon">
+    <script src="Mastering%20the%20game%20of%20Go%20without%20human%20knowledge%20_%20Nature_files/jquery-3.6.0.min.js"></script>
+</head>
+
+<body>
+    <script type="text/javascript">
+        let menu;
+        let article;
+        let position;
+        const clip =(element) => {
+            var $temp = $("<input>");
+            $("body").append($temp);
+            $temp.val($(element).text()).select();
+            document.execCommand("copy");
+            $temp.remove();
+        }
+        const rollupi = () => {
+            position = position - 2;
+            menu.style.left = position.toString() + 'vw';
+            article.style.left = (position + 20).toString() + 'vw';
+            article.style.width = (80 - position).toString() + 'vw';
+            if (position > -20)
+                setTimeout(rollupi, 33);
+            else
+                document.getElementById('rollback').style.display = 'block';
+        }
+
+        const rollup = () => {
+            menu = document.getElementById('minu');
+            article = document.getElementById('article');
+            position = 0;
+            rollupi();
+        }
+
+        const rollbacki = () => {
+            position = position + 2;
+            menu.style.left = position.toString() + 'vw';
+            article.style.left = (position + 20).toString() + 'vw';
+            article.style.width = (80 - position).toString() + 'vw';
+            if (position < 0)
+                setTimeout(rollbacki, 33);
+        }
+
+        const rollback = () => {
+            menu = document.getElementById('minu');
+            article = document.getElementById('article');
+            document.getElementById('rollback').style.display = 'none';
+            document.getElementById('roll').style.display = 'block';
+            position = -20;
+            rollbacki();
+        }
+        const rollshow = () => {
+            document.getElementById('roll').style.display = 'block';
+        }
+        setTimeout(rollshow, 0);
+    </script>
+
+    <style type="text/css">
+        html,
+        body {
+            height: 100vh;
+            width: 100vw;
+            margin: 0;
+            padding: 0;
+            overflow: hidden
+        }
+
+        div {
+            font-family: -apple-system, BlinkMacSystemFont, Roboto, Helvetica Neue, sans-serif
+        }
+
+        #minu {
+            width: 19.9vw;
+            height: 100vh;
+            position: absolute;
+            z-index: 1;
+            top: 0;
+            background-color: white;
+            border-right: solid 0.1vw #dfdfdf;
+            overflow: hidden
+        }
+
+        #roll {
+            display: none;
+            position: absolute;
+            z-index: 2;
+            top: 12vw;
+            left: 17vw;
+            width: 4vw;
+            height: 4vw;
+            border: solid 1vw #dfdfdf;
+            border-radius: 4vw;
+            color: #999;
+            font-size: 3vw;
+            line-height: 3vw;
+            cursor: pointer;
+            background: #dfdfdf
+        }
+
+        #roll:hover {
+            background: #d3d3d3;
+            border-color: #d3d3d3
+        }
+
+        #rollback {
+            position: absolute;
+            top: 40vh;
+            left: 0;
+            background: none;
+            z-index: 4;
+            cursor: pointer;
+            width: 96px;
+            min-width: 64px;
+            max-width: 6vw
+        }
+
+        #rollback img {
+            width: 100%
+        }
+
+        #article {
+            height: 100vh;
+            position: absolute;
+            z-index: 3;
+            top: 0;
+        }
+
+        embed {
+            width: 100%;
+            height: 100%
+        }
+
+        #header {
+            display: block
+        }
+
+        #header div {
+            display: inline-block;
+            vertical-align: middle;
+            text-align: center
+        }
+
+        #header div:nth-of-type(1) {
+            width: 10vw;
+            margin-left: 1.2vw
+        }
+
+        #header div:nth-of-type(2) {
+            width: 8vw;
+            margin-top: 1vw
+        }
+
+        #logo {
+            min-width: 96px;
+            width: 100%;
+            height: auto
+        }
+
+        #sci {
+            color: darkred;
+            font-size: 3vw;
+            font-family: monospace
+        }
+
+        #sci .u {
+            border-bottom: 0.17vw solid darkred;
+            padding-bottom: 0.1vw
+        }
+
+        #motto {
+            padding-top: 1vw;
+            color: #999;
+            font-size: 1vw;
+            font-family: monospace
+        }
+
+        #minu #buttons {
+            width: 100%;
+            margin-top: 6vh
+        }
+
+        #buttons button {
+            margin-left: 2vw;
+            cursor: pointer;
+            color: #999;
+            font-family: monospace;
+            font-size: 1.22vw;
+            background: white;
+            border-radius: 0.4vw;
+            border: solid 0.1vw #999;
+            padding: 0.8vh 0.4vw 0.8vh 0.4vw
+        }
+
+        #buttons button:hover {
+            background: #efefef
+        }
+
+        #citation {
+            margin: 3vh 2vw 0 2vw;
+            font-size: 1vw;
+            font-family: monospace;
+            cursor: pointer
+        }
+
+        #citation:active {
+            color: #aaa
+        }
+
+        #citation a {
+            color: #999;
+            text-decoration: none
+        }
+
+        #citation a:hover {
+            text-decoration: underline
+        }
+
+        #doi {
+            margin: 3vh 2vw 0 2vw;
+            font-size: 1vw;
+            color: #aaa
+        }
+
+        #doi a {
+            color: #aaa;
+            text-decoration: none;
+            word-wrap: break-all;
+            word-break: break-all
+        }
+
+        #doi a:hover {
+            background: #eee
+        }
+
+        #versions {
+            margin: 3vh 0 0 2vw;
+            font-size: 1vw;
+            color: #aaa
+        }
+
+        #versions a {
+            color: black;
+            text-decoration: none
+        }
+
+        #versions a:hover {
+            text-decoration: underline
+        }
+    </style>
+
+
+
+    <style type="text/css">
+        #minu {
+            left: 0
+        }
+
+        #rollback {
+            display: none
+        }
+
+        #article {
+            width: 80vw;
+            left: 20vw
+        }
+
+
+        #alipay {}
+
+        #alipay p {
+            text-align: center
+        }
+
+        #alipay p:nth-of-type(1) {
+            margin: 7vh 0 0 0;
+            font-size: 1vw;
+            font-family: sans
+        }
+
+        #alipay p:nth-of-type(1) span {
+            background: green;
+            color: white
+        }
+
+        #alipay p:nth-of-type(2) {
+            margin: 0 0 0 0;
+            padding: 0;
+            font-size: 1vw;
+            font-family: sans
+        }
+
+        #alipay p:nth-of-type(2) span {
+            background: green;
+            color: white
+        }
+
+        #alipay p:nth-of-type(3) {}
+
+        #alipay p:nth-of-type(3) img {
+            max-width: 66%
+        }
+
+        ;
+    </style>
+
+    <div id="roll" onclick="rollup()" style="display: block;">◂</div>
+    <div id="rollback" onclick="rollback()">
+        <img id="rollimg" src="Mastering%20the%20game%20of%20Go%20without%20human%20knowledge%20_%20Nature_files/ravenround.gif">
+    </div>
+
+    <div id="minu">
+
+        <a id="header" href="https://sci-hub.arizonastockbroker.com/">
+            <div>
+                <img id="logo" src="Mastering%20the%20game%20of%20Go%20without%20human%20knowledge%20_%20Nature_files/ravenround.gif">
+            </div>
+            <div>
+                <span id="sci"><span class="u">sci</span><br>hub</span><br>
+                <span id="motto">to open science</span>
+            </div>
+        </a>
+
+        <div id="buttons">
+		<button onclick="window.open('https://www.3098.me/science-hub-mutual-aid-community-registration-and-usage-tutorial/');">Get Papers Free</button>			
+        <button onclick="location.href='https:\/\/sci.bban.top\/pdf\/10.1038\/nature24270.pdf?download=true'" style="margin-left: 0.5vw;">↓save</button>
+		<button onclick="window.open('https://gpt.lovetoome.com');" style="margin-top: 5px;">Free GPT4</button>
+		<button onclick="window.open('https://www.helicard.com/Deepseek/');" style="margin-top: 5px;">Deepseek</button>	
+        </div>
+
+        <div id="alipay">
+
+        </div>
+
+        <div id="citation" onclick="clip(this)">Silver, David; 
+Schrittwieser, Julian; Simonyan, Karen; Antonoglou, Ioannis; Huang, Aja;
+ Guez, Arthur; Hubert, Thomas; Baker, Lucas; Lai, Matthew; Bolton, 
+Adrian; Chen, Yutian; Lillicrap, Timothy; Hui, Fan; Sifre, Laurent; van 
+den Driessche, George; Graepel, Thore; Hassabis, Demis . (2017). <i>Mastering the game of Go without human knowledge. Nature, 550(7676), 354–359.
+        </i>
+            doi:10.1038/nature24270&nbsp;</div>
+
+        
+
+        <div id="versions">
+<script async="" src="Mastering%20the%20game%20of%20Go%20without%20human%20knowledge%20_%20Nature_files/googlesyndication_adsbygoogle.js" crossorigin="anonymous"></script>
+<!-- 300X25 -->
+<ins class="adsbygoogle" style="display:inline-block;width:300px;height:250px" data-ad-client="ca-pub-6519940490469868" data-ad-slot="2994063769" data-adsbygoogle-status="done"><iframe id="aswift_0" style="height: 1px !important; max-height: 1px !important; max-width: 1px !important; width: 1px !important;"><iframe id="google_ads_frame0"></iframe></iframe></ins>
+<script>
+     (adsbygoogle = window.adsbygoogle || []).push({});
+</script>
+
+
+        </div>
+        <div id="doi">
+        <a rel="nofollow" target="_blank" href="https://www.3098.me/who-exactly-should-pay-for-academic-research/">
+        An interview with Sci-Hub Founder Alexandra Elbakyan,Who exactly should pay for academic research</a>
+		</div>
+    </div>
+
+    <div id="article">
+        <embed type="application/pdf" src="Mastering%20the%20game%20of%20Go%20without%20human%20knowledge%20_%20Nature_files/nature24270.pdf" id="pdf">
+        
+    </div>
+
+
+<script async="" src="Mastering%20the%20game%20of%20Go%20without%20human%20knowledge%20_%20Nature_files/googlesyndication_adsbygoogle.js" crossorigin="anonymous"></script>
+
+
+</body></html>

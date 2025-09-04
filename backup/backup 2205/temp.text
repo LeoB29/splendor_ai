@@ -1,0 +1,70 @@
+def simulate_game_with_mcts(game_state: GameState, mcts_fn, verbose=False):
+    state = game_state
+    turn = 0
+    player_index = state.current_player
+
+    trajectory = []  # (state, action) tuples
+
+    while not state.is_terminal:
+        legal_actions = state.get_legal_actions()
+        if not legal_actions:
+            state.current_player = (state.current_player + 1) % len(state.players)
+            continue
+
+        action = mcts_fn(state)  # Replace random with MCTS!
+        trajectory.append((state.clone(), action))
+
+        if verbose:
+            print(f"Turn {turn}: Player {state.current_player} takes action {action.action_type}")
+        state = state.apply_action(action)
+        turn += 1
+
+    reward = state.get_reward(player_index)
+    return trajectory, reward
+
+✅ Phase 2: Add Simple MCTS Wrapper
+
+def mcts_fn(state):
+    return mcts_search(state, time_limit=0.1)  # Fast simulations
+
+✅ Phase 3: Run Multiple Games and Collect Data
+
+def run_self_play_data(num_games=100):
+    data = []
+    for _ in range(num_games):
+        game = setup_game()
+        traj, reward = simulate_game_with_mcts(game, mcts_fn)
+        for state, action in traj:
+            data.append((state, action, reward))
+    return data
+
+
+
+    def next_move(self):
+        if self.game.is_terminal:
+            messagebox.showinfo("Game Over", f"Player {self.game.winner + 1} wins!")
+            return
+
+        action = mcts_fn(self.game)
+
+        # Track last action and show in label
+        self.last_action_label.config(text=f"Last action: {action}")
+
+        # Update game state
+        new_state = self.game.apply_action(action)
+
+        # If the action was to buy or reserve a card, replace it from the deck
+        if action['type'] in ['purchase', 'reserve'] and 'tier' in action:
+            tier = action['tier']
+            if self.game.deck[tier]:
+                replacement_card = self.game.deck[tier].pop(0)
+                for idx, card in enumerate(self.game.board[tier]):
+                    if card == action.get('card'):
+                        new_state.board[tier][idx] = replacement_card
+                        break
+            else:
+                # If deck is empty, remove the card
+                new_state.board[tier] = [c for c in new_state.board[tier] if c != action.get('card')]
+
+        self.game = new_state
+        self.draw_board()

@@ -1,0 +1,10 @@
+- Quand on achète une carte : il faudrait rajouter des actions pour savoir quelles gemmes dépenser (gold ou pas ...)
+
+
+- Populate full deck with right format
+- Vérifier que les règles sont correctes (limite de 10 jetons etc...)
+
+Pb : 
+les cartes ne se remplacent pas ? 
+n'arrivent pas à acheter d'autres cartes que tier 1
+commence toujours par tier 1?
