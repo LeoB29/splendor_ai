@@ -1,5 +1,5 @@
 # Splendor AI �?" Session Notes
-Latest session notes: [2025-09-03](session_notes_2025-09-03.md)
+Latest session notes: [2025-09-05](session_notes_2025-09-05.md)
 
 Date: keep updated per session
 
@@ -91,4 +91,3 @@ We add a small amount of random noise sampled from a Dirichlet distribution to t
 ## �?oValue head starts at 0�?? �?" simple explanation
 
 The value head predicts who is likely to win from a position, mapped to the range [-1, 1]. At initialization, the network�?Ts weights are random, so its value outputs are typically near 0 (i.e., �?ounsure/tie�??). Your training targets are A�1 at game end, so the initial mean squared error is roughly (A�1 - 0)^2 = 1. As training progresses and targets become consistent, the value head learns to output numbers closer to A�1 for clearly winning/losing positions, and the value loss drops.
-

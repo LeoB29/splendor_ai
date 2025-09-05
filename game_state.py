@@ -62,6 +62,8 @@ class GameState:
         # starting from the initial player. Tie-breaker handled on finalize.
         self.start_player: int = current_player
         self.pending_round_end: bool = False
+        # Debug guard so we only log one snapshot per state when there are no legal actions
+        self._no_legal_logged: bool = False
 
     def clone(self):
         return deepcopy(self)
@@ -117,6 +119,30 @@ class GameState:
                         self._add_return_combinations(actions, player, tokens_taken, excess,
                                                     action_type="reserve", target=card, tier=tier)
 
+        # Debug snapshot if no legal actions (should be rare)
+        if not actions and not self._no_legal_logged:
+            try:
+                bank_ge4 = [c for c in colors if self.tokens.get(c, 0) >= 4]
+                board_sizes = {t: len(cs) for t, cs in self.board.items()}
+                deck_sizes = {t: len(ds) for t, ds in self.deck.items()}
+                print(
+                    "[NoLegal] p=%d bank=%s p_tokens=%s bonuses=%s reserved=%d can_reserve=%s colors_avail=%s bank_ge4=%s board=%s deck=%s"
+                    % (
+                        self.current_player,
+                        dict(self.tokens),
+                        dict(player.tokens),
+                        dict(player.bonuses),
+                        len(player.reserved),
+                        player.can_reserve(),
+                        colors,
+                        bank_ge4,
+                        board_sizes,
+                        deck_sizes,
+                    )
+                )
+            except Exception:
+                pass
+            self._no_legal_logged = True
         return actions
 
     def can_afford(self, player: PlayerState, card: Card):

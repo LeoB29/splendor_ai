@@ -608,17 +608,23 @@ def _find_latest_checkpoint(ckpt_dir: str) -> Optional[Tuple[str, int]]:
     return (best_path, best_iter) if best_path is not None else None
 
 
-def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: int = 32, device: str = "cpu", mcts_batch: int = 16) -> float:
+def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: int = 32, device: str = "cpu", mcts_batch: int = 16, max_moves: int = 250) -> float:
     wins = 0
     for g in range(games):
         state = setup_game(num_players=2)
         mcts = AlphaZeroMCTS(model, device=device, n_simulations=mcts_simulations, mcts_batch=mcts_batch)
         # Alternate who starts
         my_index = g % 2
+        move_count = 0
+        consecutive_passes = 0
         while not state.is_terminal:
             legal = state.get_legal_actions()
             if not legal:
                 state.current_player = (state.current_player + 1) % len(state.players)
+                consecutive_passes += 1
+                # Break stalemates where neither player has legal moves
+                if consecutive_passes >= len(state.players) or move_count >= max_moves:
+                    break
                 continue
             played_a_idx: Optional[int] = None
             if state.current_player == my_index:
@@ -638,6 +644,8 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
                 a = random.choice(legal)
                 played_a_idx = None
             state = state.apply_action(a)
+            move_count += 1
+            consecutive_passes = 0
             if played_a_idx is not None:
                 try:
                     mcts.reuse_after_play(played_a_idx)
@@ -645,6 +653,10 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
                     pass
         if state.winner == my_index:
             wins += 1
+        # Lightweight eval progress
+        interval = max(1, games // 10)
+        if ((g + 1) % interval == 0) or (g + 1 == games):
+            print(f"[Eval] {g+1}/{games} games done")
     return wins / games if games > 0 else 0.0
 
 
@@ -692,16 +704,32 @@ def az_train(
         except Exception as e:
             print(f"[Info] torch.compile unavailable: {e}")
     # Optimizer: avoid DirectML CPU-fallback for foreach ops by disabling foreach
+    def _configure_optimizer_for_device(opt: optim.Optimizer, dev: Any) -> None:
+        try:
+            is_cuda = (isinstance(dev, torch.device) and dev.type == "cuda") or (isinstance(dev, str) and str(dev).startswith("cuda"))
+            for pg in opt.param_groups:
+                # On DirectML/CPU, disable foreach/fused/capturable to avoid CPU fallbacks
+                if not is_cuda:
+                    try:
+                        pg["foreach"] = False  # type: ignore[index]
+                    except Exception:
+                        pass
+                    try:
+                        pg["fused"] = False  # type: ignore[index]
+                    except Exception:
+                        pass
+                    try:
+                        pg["capturable"] = False  # type: ignore[index]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     try:
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay, foreach=False)  # type: ignore[call-arg]
     except TypeError:
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-        # Older torch may not accept foreach kw; try forcing per-group flag
-        try:
-            for pg in optimizer.param_groups:
-                pg["foreach"] = False  # type: ignore[index]
-        except Exception:
-            pass
+    _configure_optimizer_for_device(optimizer, device)
     # Enable TF32 on CUDA (Ampere+)
     try:
         if (isinstance(device, torch.device) and device.type == "cuda") or (isinstance(device, str) and str(device).startswith("cuda")):
@@ -738,6 +766,7 @@ def az_train(
                     ck = torch.load(resume_path, map_location='cpu')
                 model.load_state_dict(ck["model"])
                 optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
+                _configure_optimizer_for_device(optimizer, device)
                 # Move optimizer state tensors to target device
                 try:
                     for state in optimizer.state.values():  # type: ignore[attr-defined]
@@ -762,6 +791,7 @@ def az_train(
                         ck = torch.load(path, map_location='cpu')
                     model.load_state_dict(ck["model"])
                     optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
+                    _configure_optimizer_for_device(optimizer, device)
                     # Move optimizer state tensors to target device
                     try:
                         for state in optimizer.state.values():  # type: ignore[attr-defined]
@@ -779,6 +809,7 @@ def az_train(
     for step in range(1, iterations + 1):
         it = start_iter_global + step
         step_counts: List[int] = []
+        print(f"[Iter {it}] Self-play: {games_per_iter} games")
         for g in range(games_per_iter):
             traj, winner = self_play_episode(
                 model,
@@ -794,12 +825,14 @@ def az_train(
             X, P, Z = compute_targets(traj, winner)
             buffer.add(X, P, Z)
             step_counts.append(len(traj))
+            print(f"[Iter {it}] Self-play {g+1}/{games_per_iter} steps={len(traj)}")
 
         # Train from replay buffer
         losses = []
         pol_losses = []
         val_losses = []
-        for _ in range(train_batches_per_iter):
+        print(f"[Iter {it}] Train: {train_batches_per_iter} batches (buffer={buffer.size()})")
+        for bi in range(train_batches_per_iter):
             if buffer.size() == 0:
                 break
             batch = buffer.sample(batch_size)
@@ -816,6 +849,9 @@ def az_train(
             losses.append(stats["loss"])
             pol_losses.append(stats["policy_loss"])
             val_losses.append(stats["value_loss"])
+            interval = max(1, train_batches_per_iter // 5)
+            if ((bi + 1) % interval == 0) or (bi + 1 == train_batches_per_iter):
+                print(f"[Iter {it}] Train {bi+1}/{train_batches_per_iter} loss={stats['loss']:.4f}")
 
         avg_loss = float(np.mean(losses)) if losses else float("nan")
         avg_pl = float(np.mean(pol_losses)) if pol_losses else float("nan")
@@ -823,6 +859,7 @@ def az_train(
         avg_steps = float(np.mean(step_counts)) if step_counts else 0.0
 
         # Evaluate vs random
+        print(f"[Iter {it}] Eval: {eval_games} games")
         win_rate = evaluate_vs_random(
             model,
             games=eval_games,
