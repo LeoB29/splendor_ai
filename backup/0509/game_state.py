@@ -2,12 +2,6 @@ from copy import deepcopy
 from typing import List, Dict, Optional
 from itertools import combinations, chain
 
-# Debug toggle for guard logs
-DEBUG_GUARDS = False
-
-# Fixed gem color order to match encoding elsewhere
-GEM_COLORS = ["diamond", "sapphire", "obsidian", "ruby", "emerald"]
-
 
 class Card:
     def __init__(self, tier, cost, bonus_color, points=0):
@@ -43,13 +37,12 @@ class PlayerState:
         return len(self.reserved) < 3
 
 class Action:
-    def __init__(self, action_type: str, target=None, tokens_taken=None, tokens_returned=None, tier=None, from_deck: bool = False):
+    def __init__(self, action_type: str, target=None, tokens_taken=None, tokens_returned=None, tier=None):
         self.action_type = action_type  # "take_tokens", "buy_card", "buy_reserved", "reserve"
-        self.target = target            # Card (for buy/reserve); None when reserving from deck
+        self.target = target            # Card (for buy/reserve)
         self.tokens_taken = tokens_taken or {}
         self.tokens_returned = tokens_returned or {}
         self.tier = tier                # For reserve card
-        self.from_deck = from_deck      # Reserve top card from deck (not visible)
 
 
 
@@ -75,14 +68,6 @@ class GameState:
     def clone(self):
         return deepcopy(self)
 
-    def _dbg(self, msg: str) -> None:
-        # Print debug messages only if enabled on instance or module flag
-        if getattr(self, 'debug', False) or DEBUG_GUARDS:
-            try:
-                print(msg)
-            except Exception:
-                pass
-
     def _clamp_tokens_nonnegative(self, tokens: Dict[str, int]) -> Dict[str, int]:
         """Clamp all token counts to be >= 0. Returns the possibly-updated dict."""
         for k in list(tokens.keys()):
@@ -104,41 +89,17 @@ class GameState:
         actions = []
         player = self.players[self.current_player]
         total_tokens = player.total_tokens()
-        # Colors available in bank (excluding gold)
-        colors = [c for c in GEM_COLORS if self.tokens.get(c, 0) > 0]
+        colors = [c for c in self.tokens if self.tokens[c] > 0 and c != 'gold']
 
-        # Take 3 different tokens (with dedupe when <3 colors available)
-        avail = [c for c in GEM_COLORS if self.tokens.get(c, 0) > 0]
-        rep_combos = []  # list of 3-color tuples to encode action indices consistently
-        if len(avail) >= 3:
-            rep_combos = [tuple(sorted(cmb)) for cmb in combinations(avail, 3)]
-        elif len(avail) == 2:
-            # choose the lexicographically first missing color as representative
-            missing = [c for c in GEM_COLORS if c not in avail]
-            third = missing[0]
-            rep_combos = [tuple(sorted((avail[0], avail[1], third)))]
-        elif len(avail) == 1:
-            missing = [c for c in GEM_COLORS if c != avail[0]]
-            third = missing[0]
-            fourth = missing[1]
-            rep_combos = [tuple(sorted((avail[0], third, fourth)))]
-        else:
-            rep_combos = []
-
-        for combo in rep_combos:
-            tokens_taken_full = {c: 1 for c in combo}
-            effective_take = {c: 1 for c in combo if self.tokens.get(c, 0) > 0}
-            eff_count = sum(effective_take.values())
-            if eff_count <= 0:
-                continue
-            new_total = total_tokens + eff_count
+        # Take 3 different tokens
+        for combo in combinations(colors, 3):
+            tokens_taken = {c: 1 for c in combo}
+            new_total = total_tokens + 3
             if new_total <= 10:
-                actions.append(Action("take_tokens", tokens_taken=tokens_taken_full))
+                actions.append(Action("take_tokens", tokens_taken=tokens_taken))
             else:
                 excess = new_total - 10
-                self._add_return_combinations_effective(
-                    actions, player, tokens_taken_full, effective_take, excess, action_type="take_tokens"
-                )
+                self._add_return_combinations(actions, player, tokens_taken, excess, action_type="take_tokens")
 
         # Take 2 of one color
         for c in colors:
@@ -162,7 +123,7 @@ class GameState:
             if self.can_afford(player, card):
                 actions.append(Action("buy_reserved", target=card))
 
-        # Reserve a card (visible)
+        # Reserve a card
         if player.can_reserve():
             for tier, cards in self.board.items():
                 for card in cards:
@@ -174,24 +135,6 @@ class GameState:
                         excess = new_total - 10
                         self._add_return_combinations(actions, player, tokens_taken, excess,
                                                     action_type="reserve", target=card, tier=tier)
-
-        # Reserve from deck (top card), allowed even without taking gold
-        if player.can_reserve():
-            for tier, deck_cards in self.deck.items():
-                if deck_cards:
-                    tokens_taken = {'gold': 1} if self.tokens.get('gold', 0) > 0 else {}
-                    eff_gain = sum(tokens_taken.values())
-                    new_total = total_tokens + eff_gain
-                    if new_total <= 10:
-                        actions.append(Action("reserve", target=None, tier=tier, tokens_taken=tokens_taken, from_deck=True))
-                    else:
-                        excess = new_total - 10
-                        # For reserve-from-deck, effective_take is just tokens_taken (gold or empty)
-                        effective_take = tokens_taken.copy()
-                        self._add_return_combinations_effective(
-                            actions, player, tokens_taken, effective_take, excess,
-                            action_type="reserve", target=None, tier=tier
-                        )
 
         # Debug snapshot if no legal actions (should be rare)
         if not actions and not self._no_legal_logged:
@@ -252,32 +195,6 @@ class GameState:
                     tokens_taken=tokens_taken,
                     tokens_returned=tokens_returned
                 ))
-
-    def _add_return_combinations_effective(self, actions, player, tokens_taken_full, effective_take, excess, action_type, target=None, tier=None):
-        # Build after_take using only effectively obtainable tokens (respecting bank shortages)
-        after_take = player.tokens.copy()
-        for color, count in effective_take.items():
-            after_take[color] = after_take.get(color, 0) + count
-
-        token_list = list(chain.from_iterable([[color] * count for color, count in after_take.items()]))
-        unique_return_sets = set()
-
-        for combo in combinations(token_list, excess):
-            ret_counter = {}
-            for c in combo:
-                ret_counter[c] = ret_counter.get(c, 0) + 1
-            unique_return_sets.add(frozenset(ret_counter.items()))
-
-        for ret_set in unique_return_sets:
-            tokens_returned = dict(ret_set)
-            if all(after_take.get(c, 0) >= count for c, count in tokens_returned.items()):
-                actions.append(Action(
-                    action_type,
-                    target=target,
-                    tier=tier,
-                    tokens_taken=tokens_taken_full,  # keep 3-color encoding for indexing
-                    tokens_returned=tokens_returned
-                ))
     
 
     def apply_action(self, action: Action):
@@ -290,14 +207,20 @@ class GameState:
                 avail = int(new_state.tokens.get(c, 0))
                 take = min(int(count), max(0, avail))
                 if take < int(count):
-                    self._dbg(f"[Guard] take_tokens: requested take {count} {c}, bank had {avail}; taking {take}")
+                    try:
+                        print(f"[Guard] take_tokens: requested take {count} {c}, bank had {avail}; taking {take}")
+                    except Exception:
+                        pass
                 new_state.tokens[c] = avail - take
                 player.tokens[c] = int(player.tokens.get(c, 0)) + take
             for c, count in action.tokens_returned.items():
                 have = int(player.tokens.get(c, 0))
                 give = min(int(count), max(0, have))
                 if give < int(count):
-                    self._dbg(f"[Guard] return_tokens: requested return {count} {c}, player had {have}; returning {give}")
+                    try:
+                        print(f"[Guard] return_tokens: requested return {count} {c}, player had {have}; returning {give}")
+                    except Exception:
+                        pass
                 player.tokens[c] = have - give
                 new_state.tokens[c] = int(new_state.tokens.get(c, 0)) + give
 
@@ -305,42 +228,35 @@ class GameState:
             card = action.target
             tier = action.tier
 
-            from_deck = bool(getattr(action, 'from_deck', False))
-            if from_deck:
-                # Reserve top card from deck (do not affect board)
-                if new_state.deck.get(tier):
-                    reserved_card = new_state.deck[tier].pop(0)
-                    player.reserved.append(reserved_card)
-                else:
-                    # Nothing to reserve; keep behavior no-op on the card move
-                    pass
-            else:
-                # Reserve visible card: remove from board
-                if card in new_state.board[tier]:
-                    new_state.board[tier].remove(card)
-                player.reserved.append(card)
+            if card in new_state.board[tier]:
+                new_state.board[tier].remove(card)
+            player.reserved.append(card)
 
             # Token transfer with guards (same as take_tokens)
             for c, count in action.tokens_taken.items():
                 avail = int(new_state.tokens.get(c, 0))
                 take = min(int(count), max(0, avail))
                 if take < int(count):
-                    self._dbg(f"[Guard] reserve: requested take {count} {c}, bank had {avail}; taking {take}")
+                    try:
+                        print(f"[Guard] reserve: requested take {count} {c}, bank had {avail}; taking {take}")
+                    except Exception:
+                        pass
                 new_state.tokens[c] = avail - take
                 player.tokens[c] = int(player.tokens.get(c, 0)) + take
             for c, count in action.tokens_returned.items():
                 have = int(player.tokens.get(c, 0))
                 give = min(int(count), max(0, have))
                 if give < int(count):
-                    self._dbg(f"[Guard] reserve return: requested return {count} {c}, player had {have}; returning {give}")
+                    try:
+                        print(f"[Guard] reserve return: requested return {count} {c}, player had {have}; returning {give}")
+                    except Exception:
+                        pass
                 player.tokens[c] = have - give
                 new_state.tokens[c] = int(new_state.tokens.get(c, 0)) + give
 
-            # Refill only if we reserved a visible card (board slot emptied)
-            if not from_deck:
-                if new_state.deck[tier]:
-                    new_card = new_state.deck[tier].pop(0)
-                    new_state.board[tier].append(new_card)
+            if new_state.deck[tier]:
+                new_card = new_state.deck[tier].pop(0)
+                new_state.board[tier].append(new_card)
 
         elif action.action_type in ['buy_card', 'buy_reserved']:
             card = action.target
@@ -355,7 +271,10 @@ class GameState:
                     gold_have = int(player.tokens.get('gold', 0))
                     gold_spend = min(int(effective), max(0, gold_have))
                     if gold_spend < int(effective):
-                        self._dbg(f"[Guard] buy: needed {effective} gold, had {gold_have}; spending {gold_spend}")
+                        try:
+                            print(f"[Guard] buy: needed {effective} gold, had {gold_have}; spending {gold_spend}")
+                        except Exception:
+                            pass
                     player.tokens['gold'] = gold_have - gold_spend
                     new_state.tokens['gold'] = int(new_state.tokens.get('gold', 0)) + gold_spend
 

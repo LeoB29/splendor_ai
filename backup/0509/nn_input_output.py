@@ -104,16 +104,12 @@ def legal_actions_mask(game_state: GameState):
     reserved_count = len(game_state.players[game_state.current_player].reserved)
     
     for action in legal:
-        # Skip actions not represented in the 43-size action space (e.g., reserve-from-deck)
-        if getattr(action, 'action_type', None) == 'reserve' and getattr(action, 'from_deck', False):
-            continue
         try:
             idx = action_to_index(action, game_state)
-            # Guard against unexpected None or out-of-range indices
-            if isinstance(idx, int) and 0 <= idx < len(mask):
-                mask[idx] = 1
-        except Exception:
-            # Ignore any actions that cannot be encoded into the fixed action space
+            mask[idx] = 1
+        except ValueError as e:
+            # Optionally print or ignore actions not convertible to indices
+            # print(e)
             pass
     return mask
 

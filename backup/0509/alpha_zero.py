@@ -471,44 +471,22 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
         probs = pi.copy()
         probs *= np.array(legal_mask, dtype=np.float32)
         if probs.sum() <= 0 or not legal_idxs:
-            # Fallback: choose a random legal Action directly (covers actions not in NN space, e.g., reserve-from-deck)
-            legals = state.get_legal_actions()
-            if legals:
-                a = random.choice(legals)
-                a_idx_for_reuse = None
-                try:
-                    from nn_input_output import action_to_index
-                    a_idx_for_reuse = action_to_index(a, state)
-                except Exception:
-                    a_idx_for_reuse = None
-                state = state.apply_action(a)
-                try:
-                    if a_idx_for_reuse is not None:
-                        mcts.reuse_after_play(a_idx_for_reuse)
-                except Exception:
-                    pass
-                move_idx += 1
-                continue
-            else:
-                # Should not hit because we handled no-legal case earlier; skip turn defensively
-                state.current_player = (state.current_player + 1) % len(state.players)
-                move_idx += 1
-                continue
+            a_idx = random.choice(legal_idxs)
         else:
             probs = probs / probs.sum()
             a_idx = int(np.random.choice(len(probs), p=probs))
 
-            action = index_to_action(a_idx, state)
-            # Use most-visited return variant for the chosen base action
-            best_ret = mcts.get_best_tokens_returned(a_idx)
-            if best_ret is not None and hasattr(action, "tokens_returned"):
-                action.tokens_returned = best_ret
-            state = state.apply_action(action)
-            # Reuse MCTS tree for next move
-            try:
-                mcts.reuse_after_play(a_idx)
-            except Exception:
-                pass
+        action = index_to_action(a_idx, state)
+        # Use most-visited return variant for the chosen base action
+        best_ret = mcts.get_best_tokens_returned(a_idx)
+        if best_ret is not None and hasattr(action, "tokens_returned"):
+            action.tokens_returned = best_ret
+        state = state.apply_action(action)
+        # Reuse MCTS tree for next move
+        try:
+            mcts.reuse_after_play(a_idx)
+        except Exception:
+            pass
         move_idx += 1
 
     winner = state.winner if state.winner is not None else -1
