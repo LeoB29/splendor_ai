@@ -93,7 +93,7 @@ def action_to_index(action: Action, game_state: GameState) -> int:
 def visible_cards_count(game_state: GameState) -> int:
     count = 0
     for tier in game_state.board:
-        count += len(game_state.board[tier])
+        count += min(4, len(game_state.board[tier]))
     return count
 
 
@@ -121,7 +121,9 @@ def legal_actions_mask(game_state: GameState):
 def flatten_visible_cards(game_state: GameState):
     visible_cards = []
     for tier in sorted(game_state.board.keys()):
-        visible_cards.extend(game_state.board[tier])
+        # Include up to 4 visible cards per tier; skip None entries
+        tier_cards = [c for c in game_state.board[tier] if c is not None]
+        visible_cards.extend(tier_cards[:4])
     return visible_cards
 
 ###### output of neural network: index to action
@@ -234,17 +236,24 @@ def flatten_game_state(game_state):
     # --- Board Cards (4 cards per tier, 3 tiers = 12 cards) ---
     for tier in game_state.board:
         cards_in_tier = game_state.board[tier]
-        for card in cards_in_tier:
-            flat_state.extend(encode_card(card))
+        # Encode at most 4 visible cards per tier
+        for card in cards_in_tier[:4]:
+            if card is None:
+                flat_state.extend([0] * (5 + 5 + 1))
+            else:
+                flat_state.extend(encode_card(card))
         # Pad if fewer than 4 cards in this tier
-        for _ in range(4 - len(cards_in_tier)):
+        for _ in range(max(0, 4 - len(cards_in_tier))):
             flat_state.extend([0] * (5 + 5 + 1))  # cost + bonus + points
 
     # --- Reserved Cards (up to 3 per player) ---
     for player in game_state.players:
         reserved_cards = getattr(player, "reserved", [])  # adjusted attr name if needed
         for card in reserved_cards:
-            flat_state.extend(encode_card(card))
+            if card is None:
+                flat_state.extend([0] * (5 + 5 + 1))
+            else:
+                flat_state.extend(encode_card(card))
         for _ in range(3 - len(reserved_cards)):
             flat_state.extend([0] * (5 + 5 + 1))
 
@@ -270,6 +279,8 @@ def flatten_game_state(game_state):
     return np.array(flat_state, dtype=np.float32)
 
 def encode_card(card):
+    if card is None:
+        return [0] * (5 + 5 + 1)
     # Cost: 5 gem types
     cost_vector = [card.cost.get(gem, 0) for gem in ["diamond", "sapphire", "obsidian", "ruby", "emerald"]]
     # Bonus: one-hot for gem type (5 slots)

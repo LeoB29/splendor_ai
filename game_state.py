@@ -99,6 +99,15 @@ class GameState:
         # Clamp player tokens
         for p in self.players:
             self._clamp_tokens_nonnegative(p.tokens)
+        # Ensure visible board doesn't exceed 4 per tier and remove None placeholders
+        try:
+            for t in list(self.board.keys()):
+                cards = [c for c in self.board[t] if c is not None]
+                if len(cards) > 4:
+                    cards = cards[:4]
+                self.board[t] = cards
+        except Exception:
+            pass
 
     def get_legal_actions(self):
         actions = []
@@ -154,11 +163,15 @@ class GameState:
         # Buy card from board
         for tier_cards in self.board.values():
             for card in tier_cards:
+                if card is None:
+                    continue
                 if self.can_afford(player, card):
                     actions.append(Action("buy_card", target=card))
 
         # Buy reserved card
         for card in player.reserved:
+            if card is None:
+                continue
             if self.can_afford(player, card):
                 actions.append(Action("buy_reserved", target=card))
 
@@ -166,6 +179,8 @@ class GameState:
         if player.can_reserve():
             for tier, cards in self.board.items():
                 for card in cards:
+                    if card is None:
+                        continue
                     tokens_taken = {'gold': 1} if self.tokens['gold'] > 0 else {}
                     new_total = total_tokens + sum(tokens_taken.values())
                     if new_total <= 10:
@@ -219,7 +234,9 @@ class GameState:
             self._no_legal_logged = True
         return actions
 
-    def can_afford(self, player: PlayerState, card: Card):
+    def can_afford(self, player: PlayerState, card: Optional[Card]):
+        if card is None:
+            return False
         needed = 0
         for color, cost in card.cost.items():
             total = player.tokens[color] + player.bonuses[color]
@@ -340,7 +357,8 @@ class GameState:
             if not from_deck:
                 if new_state.deck[tier]:
                     new_card = new_state.deck[tier].pop(0)
-                    new_state.board[tier].append(new_card)
+                    if new_card is not None:
+                        new_state.board[tier].append(new_card)
 
         elif action.action_type in ['buy_card', 'buy_reserved']:
             card = action.target

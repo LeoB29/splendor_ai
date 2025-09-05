@@ -214,13 +214,18 @@ class AlphaZeroMCTS:
         # Demand from visible cards and reserved
         visible_cards = []
         for t in sorted(state.board.keys()):
-            visible_cards.extend(state.board[t])
-        reserved_cards = player.reserved
+            # Skip None placeholders defensively
+            visible_cards.extend([c for c in state.board[t] if c is not None])
+        reserved_cards = [c for c in player.reserved if c is not None]
         all_cards = visible_cards + reserved_cards
         for card in all_cards:
-            for c, cost in card.cost.items():
-                short = max(0, cost - player.bonuses.get(c, 0) - player.tokens.get(c, 0))
-                need[c] += short
+            try:
+                for c, cost in card.cost.items():
+                    short = max(0, cost - player.bonuses.get(c, 0) - player.tokens.get(c, 0))
+                    need[c] += short
+            except Exception:
+                # Ignore malformed card objects
+                continue
         gold_penalty = (max(need.values()) if need else 0) + 3.0
 
         def score(ret: Dict[str, int]) -> float:
@@ -371,8 +376,12 @@ class AlphaZeroMCTS:
 
         temp = float(temperature)
         if temp <= 1e-3:
-            # Argmax over visit counts
-            a_idx = int(np.argmax(counts)) if counts.sum() > 0 else int(random.choice(legal_idxs))
+            # Greedy: argmax over legal actions only
+            masked_counts = counts * legal_mask
+            if masked_counts.sum() > 0:
+                a_idx = int(np.argmax(masked_counts))
+            else:
+                a_idx = int(random.choice(legal_idxs))
         else:
             # Soft sampling from counts ** (1/temp), masked to legal actions
             try:
@@ -777,15 +786,42 @@ def az_train(
     start_iter_global = 0
 
     # Resume from checkpoint if available/requested
+    def _load_checkpoint_cpu_safe(path: str):
+        """Load a checkpoint safely on CPU with best-effort fallbacks.
+        Tries weights_only=True first (PyTorch 2.4+ safe loader). If that fails due to
+        missing allowlisted globals, attempts to add them. Falls back to a normal
+        torch.load(map_location='cpu') as last resort (only use with trusted files).
+        """
+        import torch as _torch
+        # First attempt: safe weights-only if available
+        try:
+            try:
+                return _torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
+            except TypeError:
+                # Older PyTorch without weights_only
+                return _torch.load(path, map_location='cpu')
+        except Exception:
+            # Try to allowlist needed globals for safe loader, then retry
+            try:
+                try:
+                    from torch.serialization import add_safe_globals  # type: ignore
+                    try:
+                        from torch._utils import _rebuild_device_tensor_from_numpy  # type: ignore
+                        add_safe_globals([_rebuild_device_tensor_from_numpy])  # type: ignore
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return _torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
+            except Exception:
+                # Final fallback: unsafe loader on CPU (only acceptable for own checkpoints)
+                return _torch.load(path, map_location='cpu')
     if resume or resume_path:
         loaded = False
         if resume_path is not None and os.path.exists(resume_path):
             try:
                 # Load safely on CPU, then move to target device
-                try:
-                    ck = torch.load(resume_path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
-                except TypeError:
-                    ck = torch.load(resume_path, map_location='cpu')
+                ck = _load_checkpoint_cpu_safe(resume_path)
                 model.load_state_dict(ck["model"])
                 optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
                 _configure_optimizer_for_device(optimizer, device)
@@ -807,10 +843,7 @@ def az_train(
             if latest is not None:
                 path, itnum = latest
                 try:
-                    try:
-                        ck = torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
-                    except TypeError:
-                        ck = torch.load(path, map_location='cpu')
+                    ck = _load_checkpoint_cpu_safe(path)
                     model.load_state_dict(ck["model"])
                     optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
                     _configure_optimizer_for_device(optimizer, device)
