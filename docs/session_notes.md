@@ -1,5 +1,5 @@
 # Splendor AI �?" Session Notes
-Latest session notes: [2025-09-05](session_notes_2025-09-05.md)
+Latest session notes: [2025-09-06](session_notes_2025-09-06.md)
 
 Date: keep updated per session
 

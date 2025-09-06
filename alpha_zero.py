@@ -1224,6 +1224,13 @@ def az_train(
             f"win%_rand={win_rate:.1%} win%_greedy={win_g:.1%} margin_g={margin_g:.2f} len_g={len_g:.1f}"
         )
 
+        # Display the full training log so far (including both win rates)
+        try:
+            with open(log_path, "r") as f:
+                print("[TrainLog]\n" + f.read().rstrip())
+        except Exception:
+            pass
+
     return model
 
 
