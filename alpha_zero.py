@@ -10,6 +10,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from typing import Any
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+#DEBUG
+#import game_state as GS
+#GS.DEBUG_GUARDS = True
 
 # Optional DirectML (AMD on Windows)
 try:
@@ -18,7 +23,7 @@ try:
 except Exception:
     DML_DEVICE = None
 
-from game_state import GameState
+from game_state import GameState, Action, Card, PlayerState
 from nn_input_output import flatten_game_state, legal_actions_mask, index_to_action
 from cards_init import setup_game
 
@@ -26,27 +31,37 @@ from cards_init import setup_game
 # -----------------------------
 # Policy + Value Network (MLP)
 # -----------------------------
-class PolicyValueNet(nn.Module):
-    def __init__(self, input_size: int, action_size: int = 43, hidden: int = 256):
+class ResidualBlock(nn.Module):
+    def __init__(self, width: int):
         super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(input_size, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-        )
-        self.policy_head = nn.Linear(hidden, action_size)
+        self.fc1 = nn.Linear(width, width)
+        self.fc2 = nn.Linear(width, width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = torch.relu(self.fc1(x))
+        h = self.fc2(h)
+        return torch.relu(x + h)
+
+
+class PolicyValueNet(nn.Module):
+    def __init__(self, input_size: int, action_size: int = 43, width: int = 512, n_blocks: int = 4):
+        super().__init__()
+        self.inp = nn.Linear(input_size, width)
+        self.blocks = nn.ModuleList([ResidualBlock(width) for _ in range(max(1, int(n_blocks)))])
+        self.policy_head = nn.Linear(width, action_size)
         self.value_head = nn.Sequential(
-            nn.Linear(hidden, 64),
+            nn.Linear(width, width // 2),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(max(1, width // 2), 1),
             nn.Tanh(),  # value in [-1, 1]
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.backbone(x)
-        logits = self.policy_head(h)  # (B, A)
-        value = self.value_head(h).squeeze(-1)  # (B,)
+        h = torch.relu(self.inp(x))
+        for blk in self.blocks:
+            h = blk(h)
+        logits = self.policy_head(h)
+        value = self.value_head(h).squeeze(-1)
         return logits, value
 
 
@@ -166,25 +181,31 @@ class AlphaZeroMCTS:
         if 0 <= a_idx <= 9:
             gems_idx = TAKE_3_DIFF_COMBOS[a_idx]
             tokens_taken = {IDX_TO_GEM[g]: 1 for g in gems_idx}
+            # Effective take limited by bank availability
+            effective_taken: Dict[str, int] = {c: 1 for c in tokens_taken if state.tokens.get(c, 0) > 0}
             action_type = "take_tokens"
         elif 10 <= a_idx <= 14:
             gem_idx = a_idx - 10
             gem = IDX_TO_GEM[gem_idx]
+            want = 2
+            have = int(state.tokens.get(gem, 0))
+            take_n = min(want, have)
             tokens_taken = {gem: 2}
+            effective_taken = {gem: take_n} if take_n > 0 else {}
             action_type = "take_tokens"
         elif 30 <= a_idx <= 41:
             # Reserve visible card; index_to_action will resolve target/tier, here only tokens_taken matters
-            if state.tokens.get("gold", 0) > 0:
-                tokens_taken = {"gold": 1}
-            else:
-                tokens_taken = {}
+            g = int(state.tokens.get("gold", 0))
+            tokens_taken = {"gold": 1} if g > 0 else {}
+            effective_taken = tokens_taken.copy()
             action_type = "reserve"
         else:
             # Other actions don't need explicit return variants
             return [], []
 
+        # Build after-state using effective taken amounts
         after = player.tokens.copy()
-        for c, k in tokens_taken.items():
+        for c, k in (effective_taken.items() if 'effective_taken' in locals() else tokens_taken.items()):
             after[c] = after.get(c, 0) + k
         total = sum(after.values())
         excess = max(0, total - 10)
@@ -436,6 +457,57 @@ class AlphaZeroMCTS:
         self._root = child if child is not None else None
 
 
+def _load_ckpt_model(path: str, device: Any, input_size: int, action_size: int) -> Optional[PolicyValueNet]:
+    try:
+        model = PolicyValueNet(input_size=input_size, action_size=action_size).to(device)
+        try:
+            ck = torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
+        except TypeError:
+            ck = torch.load(path, map_location='cpu')
+        sd = ck.get("model", ck)
+        model.load_state_dict(sd)
+        return model.to(device)
+    except Exception as e:
+        print(f"[Arena] Failed loading model from {path}: {e}")
+        return None
+
+
+def arena_vs_model(model: PolicyValueNet, opp: PolicyValueNet, games: int = 100, sims: int = 64, device: Any = "cpu", mcts_batch: int = 16, max_moves: int = 250) -> tuple[float, float]:
+    wins = 0
+    margins: list[float] = []
+    for g in range(games):
+        state = setup_game(num_players=2)
+        my_index = g % 2
+        mcts_me = AlphaZeroMCTS(model, device=device, n_simulations=sims, mcts_batch=mcts_batch)
+        mcts_opp = AlphaZeroMCTS(opp, device=device, n_simulations=sims, mcts_batch=mcts_batch)
+        move_count = 0
+        while not state.is_terminal and move_count < max_moves:
+            legal = state.get_legal_actions()
+            if not legal:
+                state.current_player = (state.current_player + 1) % len(state.players)
+                continue
+            if state.current_player == my_index:
+                _, a_idx = mcts_me.run(state, temperature=0.0)
+                a = index_to_action(a_idx, state) if a_idx != -1 else legal[0]
+                best_ret = mcts_me.get_best_tokens_returned(a_idx)
+                if best_ret is not None and hasattr(a, "tokens_returned"):
+                    a.tokens_returned = best_ret
+            else:
+                _, a_idx = mcts_opp.run(state, temperature=0.0)
+                a = index_to_action(a_idx, state) if a_idx != -1 else legal[0]
+                best_ret = mcts_opp.get_best_tokens_returned(a_idx)
+                if best_ret is not None and hasattr(a, "tokens_returned"):
+                    a.tokens_returned = best_ret
+            state = state.apply_action(a)
+            move_count += 1
+        my_pts = state.players[my_index].points
+        opp_pts = state.players[1 - my_index].points
+        margins.append(my_pts - opp_pts)
+        if state.winner == my_index:
+            wins += 1
+    return (wins / games if games > 0 else 0.0), (float(np.mean(margins)) if margins else 0.0)
+
+
 # -----------------------------
 # Self-play and Training
 # -----------------------------
@@ -537,7 +609,7 @@ def compute_targets(trajectory: List[Sample], winner: int) -> Tuple[torch.Tensor
 
 def train_on_batch(model: PolicyValueNet, optimizer: optim.Optimizer, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], device: Any = "cpu",
                    policy_weight: float = 1.0, value_weight: float = 1.0, grad_clip: Optional[float] = None,
-                   scaler: Optional[Any] = None) -> Dict[str, float]:
+                   scaler: Optional[Any] = None, entropy_coef: float = 0.0) -> Dict[str, float]:
     X, P, Z = batch
     X, P, Z = X.to(device), P.to(device), Z.to(device)
     use_cuda = (isinstance(device, torch.device) and device.type == "cuda") or (isinstance(device, str) and str(device).startswith("cuda"))
@@ -553,16 +625,21 @@ def train_on_batch(model: PolicyValueNet, optimizer: optim.Optimizer, batch: Tup
                 logits, values = model(X)
                 log_probs = torch.log_softmax(logits, dim=-1)
                 policy_loss = -(P * log_probs).sum(dim=-1).mean()
+                # Entropy bonus (maximize entropy => subtract from loss)
+                probs = torch.softmax(logits, dim=-1)
+                entropy = (-(probs * torch.log_softmax(logits, dim=-1))).sum(dim=-1).mean()
                 value_loss = nn.functional.mse_loss(values, Z)
-                loss = policy_weight * policy_loss + value_weight * value_loss
+                loss = policy_weight * policy_loss + value_weight * value_loss - float(entropy_coef) * entropy
         except Exception:
             # Backward compatibility
             with torch.cuda.amp.autocast():  # type: ignore[attr-defined]
                 logits, values = model(X)
                 log_probs = torch.log_softmax(logits, dim=-1)
                 policy_loss = -(P * log_probs).sum(dim=-1).mean()
+                probs = torch.softmax(logits, dim=-1)
+                entropy = (-(probs * torch.log_softmax(logits, dim=-1))).sum(dim=-1).mean()
                 value_loss = nn.functional.mse_loss(values, Z)
-                loss = policy_weight * policy_loss + value_weight * value_loss
+                loss = policy_weight * policy_loss + value_weight * value_loss - float(entropy_coef) * entropy
         scaler.scale(loss).backward()
         if grad_clip is not None and grad_clip > 0:
             scaler.unscale_(optimizer)
@@ -574,9 +651,11 @@ def train_on_batch(model: PolicyValueNet, optimizer: optim.Optimizer, batch: Tup
         # Policy loss: cross-entropy between target pi and predicted log-probs (masked by pi)
         log_probs = torch.log_softmax(logits, dim=-1)
         policy_loss = -(P * log_probs).sum(dim=-1).mean()
+        probs = torch.softmax(logits, dim=-1)
+        entropy = (-(probs * torch.log_softmax(logits, dim=-1))).sum(dim=-1).mean()
         # Value loss: MSE
         value_loss = nn.functional.mse_loss(values, Z)
-        loss = policy_weight * policy_loss + value_weight * value_loss
+        loss = policy_weight * policy_loss + value_weight * value_loss - float(entropy_coef) * entropy
         loss.backward()
         if grad_clip is not None and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -586,6 +665,7 @@ def train_on_batch(model: PolicyValueNet, optimizer: optim.Optimizer, batch: Tup
         "loss": float((policy_weight * policy_loss + value_weight * value_loss).item()),
         "policy_loss": float(policy_loss.item()),
         "value_loss": float(value_loss.item()),
+        "entropy": float(entropy.item()),
     }
 
 
@@ -691,6 +771,112 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
     return wins / games if games > 0 else 0.0
 
 
+def _greedy_action(state: GameState) -> Action:
+    # Simple heuristic: prefer immediate points, then cheapest next, then take tokens aiding deficits.
+    legal = state.get_legal_actions()
+    if not legal:
+        # Return a no-op style by advancing player handled by caller; choose random
+        import random
+        return random.choice(legal) if legal else Action("take_tokens", tokens_taken={})
+
+    def afford_deficit(card: Card, player: PlayerState) -> int:
+        d = 0
+        for c, cost in getattr(card, 'cost', {}).items():
+            have = player.tokens.get(c, 0) + player.bonuses.get(c, 0)
+            if have < cost:
+                d += (cost - have)
+        # gold can cover some later; we ignore to keep simple
+        return d
+
+    player = state.players[state.current_player]
+    best = None
+    best_key = (-1_000_000, )
+    for a in legal:
+        key = (0, 0, 0)
+        if a.action_type in ("buy_card", "buy_reserved") and a.target is not None:
+            pts = getattr(a.target, 'points', 0)
+            # Favor points heavily; small tie-breaker by bonus rarity
+            key = (1000 + pts * 100, 10 - player.bonuses.get(getattr(a.target, 'bonus_color', ''), 0), -sum(getattr(a.target, 'cost', {}).values()))
+        elif a.action_type == "reserve":
+            # Prefer visible reserves with gold when low on tokens
+            gain_gold = int(a.tokens_taken.get('gold', 0) > 0)
+            key = (100 if gain_gold else 10, 0, 0)
+        elif a.action_type == "take_tokens":
+            # Score token take by how much it reduces average deficit to cheapest few cards
+            # Construct after-take token counts
+            after = player.tokens.copy()
+            for c, k in a.tokens_taken.items():
+                after[c] = after.get(c, 0) + k
+            for c, k in a.tokens_returned.items():
+                after[c] = max(0, after.get(c, 0) - k)
+            tmp_player = PlayerState()
+            tmp_player.tokens = after
+            tmp_player.bonuses = player.bonuses.copy()
+            # Collect visible cards
+            vis: list[Card] = []
+            for t in sorted(state.board.keys()):
+                vis.extend([c for c in state.board[t] if c is not None])
+            vis = vis[:12]
+            if vis:
+                deficits = sorted(afford_deficit(c, tmp_player) for c in vis)
+                score = -sum(deficits[:3])  # reduce smallest deficits
+            else:
+                score = 0
+            key = (score, 0, 0)
+        if key > best_key:
+            best_key = key
+            best = a
+    return best if best is not None else legal[0]
+
+
+def evaluate_vs_greedy(model: PolicyValueNet, games: int = 50, mcts_simulations: int = 64, device: str = "cpu", mcts_batch: int = 16, max_moves: int = 250) -> tuple[float, float, float]:
+    wins = 0
+    margins = []
+    lengths = []
+    for g in range(games):
+        state = setup_game(num_players=2)
+        mcts = AlphaZeroMCTS(model, device=device, n_simulations=mcts_simulations, mcts_batch=mcts_batch)
+        my_index = g % 2
+        move_count = 0
+        consecutive_passes = 0
+        while not state.is_terminal and move_count < max_moves:
+            legal = state.get_legal_actions()
+            if not legal:
+                state.current_player = (state.current_player + 1) % len(state.players)
+                consecutive_passes += 1
+                if consecutive_passes >= len(state.players):
+                    break
+                continue
+            if state.current_player == my_index:
+                _, a_idx = mcts.run(state, temperature=0.0)
+                if a_idx == -1:
+                    a = legal[0]
+                else:
+                    a = index_to_action(a_idx, state)
+                    best_ret = mcts.get_best_tokens_returned(a_idx)
+                    if best_ret is not None and hasattr(a, "tokens_returned"):
+                        a.tokens_returned = best_ret
+            else:
+                a = _greedy_action(state)
+            state = state.apply_action(a)
+            move_count += 1
+            consecutive_passes = 0
+        lengths.append(move_count)
+        my_pts = state.players[my_index].points
+        opp_pts = state.players[1 - my_index].points
+        margins.append(my_pts - opp_pts)
+        if state.winner == my_index:
+            wins += 1
+        # progress
+        interval = max(1, games // 10)
+        if ((g + 1) % interval == 0) or (g + 1 == games):
+            print(f"[EvalGreedy] {g+1}/{games} games done")
+    win_rate = wins / games if games > 0 else 0.0
+    avg_margin = float(np.mean(margins)) if margins else 0.0
+    avg_len = float(np.mean(lengths)) if lengths else 0.0
+    return win_rate, avg_margin, avg_len
+
+
 def az_train(
     iterations: int = 10,
     games_per_iter: int = 8,
@@ -714,6 +900,15 @@ def az_train(
     temp_final: float = 0.0,
     temp_moves: int = 20,
     compile_model: bool = False,
+    gate_pool: bool = False,
+    gate_games: int = 200,
+    gate_threshold: float = 0.57,
+    # LR + entropy knobs
+    use_cosine_lr: bool = True,
+    lr_min: float = 1e-4,
+    warmup_iters: int = 2,
+    entropy_init: float = 0.01,
+    entropy_anneal_iters: int = 8,
 ):
     # Setup
     os.makedirs(log_dir, exist_ok=True)
@@ -761,6 +956,14 @@ def az_train(
     except TypeError:
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     _configure_optimizer_for_device(optimizer, device)
+    # Scheduler (cosine with optional warmup)
+    scheduler: Optional[CosineAnnealingLR] = None
+    if use_cosine_lr:
+        try:
+            tmax = max(1, iterations - max(0, int(warmup_iters)))
+            scheduler = CosineAnnealingLR(optimizer, T_max=tmax, eta_min=lr_min)
+        except Exception:
+            scheduler = None
     # Enable TF32 on CUDA (Ampere+)
     try:
         if (isinstance(device, torch.device) and device.type == "cuda") or (isinstance(device, str) and str(device).startswith("cuda")):
@@ -860,6 +1063,16 @@ def az_train(
                 except Exception as e:
                     print(f"[Resume] Failed to load {path}: {e}")
 
+    # Auto-tune mcts_batch by device (CUDA:64, else:32)
+    try:
+        is_cuda = (isinstance(device, torch.device) and device.type == "cuda") or (isinstance(device, str) and str(device).startswith("cuda"))
+        if is_cuda:
+            mcts_batch = max(mcts_batch, 64)
+        else:
+            mcts_batch = max(mcts_batch, 32)
+    except Exception:
+        pass
+
     # Continue global iteration numbering
     for step in range(1, iterations + 1):
         it = start_iter_global + step
@@ -887,6 +1100,23 @@ def az_train(
         pol_losses = []
         val_losses = []
         print(f"[Iter {it}] Train: {train_batches_per_iter} batches (buffer={buffer.size()})")
+        # Entropy coefficient (linear anneal)
+        ent_coef = 0.0
+        try:
+            ent_coef = float(entropy_init) * max(0.0, 1.0 - max(0, (step - 1)) / max(1, int(entropy_anneal_iters)))
+        except Exception:
+            ent_coef = 0.0
+        # Warmup LR for first warmup_iters iterations
+        if scheduler is not None:
+            if step <= max(0, int(warmup_iters)):
+                for pg in optimizer.param_groups:
+                    pg["lr"] = float(lr) * float(step) / float(max(1, int(warmup_iters)))
+            else:
+                # Step cosine scheduler per-iteration after warmup
+                try:
+                    scheduler.step()
+                except Exception:
+                    pass
         for bi in range(train_batches_per_iter):
             if buffer.size() == 0:
                 break
@@ -900,25 +1130,39 @@ def az_train(
                 value_weight=value_weight,
                 grad_clip=grad_clip,
                 scaler=scaler,
+                entropy_coef=ent_coef,
             )
             losses.append(stats["loss"])
             pol_losses.append(stats["policy_loss"])
             val_losses.append(stats["value_loss"])
             interval = max(1, train_batches_per_iter // 5)
             if ((bi + 1) % interval == 0) or (bi + 1 == train_batches_per_iter):
-                print(f"[Iter {it}] Train {bi+1}/{train_batches_per_iter} loss={stats['loss']:.4f}")
+                # Also report LR and entropy coef occasionally
+                try:
+                    cur_lr = optimizer.param_groups[0]["lr"]
+                except Exception:
+                    cur_lr = lr
+                print(f"[Iter {it}] Train {bi+1}/{train_batches_per_iter} loss={stats['loss']:.4f} lr={cur_lr:.2e} ent={ent_coef:.4f}")
 
         avg_loss = float(np.mean(losses)) if losses else float("nan")
         avg_pl = float(np.mean(pol_losses)) if pol_losses else float("nan")
         avg_vl = float(np.mean(val_losses)) if val_losses else float("nan")
         avg_steps = float(np.mean(step_counts)) if step_counts else 0.0
 
-        # Evaluate vs random
-        print(f"[Iter {it}] Eval: {eval_games} games")
+        # Evaluate vs random (and greedy for extra signal)
+        print(f"[Iter {it}] Eval: {eval_games} games vs random")
         win_rate = evaluate_vs_random(
             model,
             games=eval_games,
-            mcts_simulations=max(16, mcts_simulations // 2),
+            mcts_simulations=mcts_simulations,  # full sims for eval
+            device=device,
+            mcts_batch=mcts_batch,
+        )
+        print(f"[Iter {it}] Eval: {eval_games} games vs greedy")
+        win_g, margin_g, len_g = evaluate_vs_greedy(
+            model,
+            games=eval_games,
+            mcts_simulations=mcts_simulations,  # full sims for eval
             device=device,
             mcts_batch=mcts_batch,
         )
@@ -932,17 +1176,52 @@ def az_train(
             "buffer_size": buffer.size(),
         }, ckpt_path)
 
+        # Optional: gate vs champion pool
+        if gate_pool:
+            try:
+                champ_path = os.path.join(ckpt_dir, "champion.pt")
+                # If no champion yet, set current as champion
+                if not os.path.exists(champ_path):
+                    torch.save({"model": model.state_dict(), "iter": it}, champ_path)
+                    print(f"[Gate] Set initial champion at iter {it}")
+                else:
+                    dummy_state = setup_game(num_players=2)
+                    input_size2 = len(flatten_game_state(dummy_state))
+                    opp_model = _load_ckpt_model(champ_path, device, input_size2, action_size)
+                    if opp_model is not None:
+                        wr, margin = arena_vs_model(model, opp_model, games=gate_games, sims=max(16, mcts_simulations // 2), device=device, mcts_batch=mcts_batch)
+                        print(f"[Gate] vs champion: win%={wr:.1%} margin={margin:.2f}")
+                        # Log gating result
+                        try:
+                            os.makedirs(log_dir, exist_ok=True)
+                            gpath = os.path.join(log_dir, "gating_log.csv")
+                            newfile = not os.path.exists(gpath)
+                            with open(gpath, "a", newline="") as gf:
+                                import csv as _csv
+                                w = _csv.writer(gf)
+                                if newfile:
+                                    w.writerow(["iter", "games", "win_rate", "margin"])
+                                w.writerow([it, gate_games, f"{wr:.4f}", f"{margin:.3f}"])
+                        except Exception:
+                            pass
+                        if wr >= gate_threshold:
+                            torch.save({"model": model.state_dict(), "iter": it}, champ_path)
+                            print(f"[Gate] Promoted iter {it} to champion (>= {gate_threshold:.0%})")
+            except Exception as e:
+                print(f"[Gate] gating failed: {e}")
+
         # Log CSV
         with open(log_path, "a", newline="") as f:
             writer = csv.writer(f)
             if write_header:
-                writer.writerow(["iter", "buffer", "avg_steps", "loss", "policy_loss", "value_loss", "win_rate"])
+                writer.writerow(["iter", "buffer", "avg_steps", "loss", "policy_loss", "value_loss", "win_rand", "win_greedy", "margin_g", "len_g"])
                 write_header = False
-            writer.writerow([it, buffer.size(), f"{avg_steps:.2f}", f"{avg_loss:.4f}", f"{avg_pl:.4f}", f"{avg_vl:.4f}", f"{win_rate:.3f}"])
+            writer.writerow([it, buffer.size(), f"{avg_steps:.2f}", f"{avg_loss:.4f}", f"{avg_pl:.4f}", f"{avg_vl:.4f}", f"{win_rate:.3f}", f"{win_g:.3f}", f"{margin_g:.3f}", f"{len_g:.2f}"])
 
         print(
             f"Iter {it:02d} | buffer={buffer.size()} steps={avg_steps:.1f} "
-            f"loss={avg_loss:.4f} pol={avg_pl:.4f} val={avg_vl:.4f} win%={win_rate:.1%}"
+            f"loss={avg_loss:.4f} pol={avg_pl:.4f} val={avg_vl:.4f} "
+            f"win%_rand={win_rate:.1%} win%_greedy={win_g:.1%} margin_g={margin_g:.2f} len_g={len_g:.1f}"
         )
 
     return model
@@ -960,11 +1239,11 @@ if __name__ == "__main__":
         dev = "cpu"
         print("[Device] Using CPU")
 
-    # Example longer run (tweak as desired)
+    # Example stronger run (residual width=512, full-sim eval)
     az_train(
         iterations=10,
         games_per_iter=8,
-        mcts_simulations=96,
+        mcts_simulations=256,
         mcts_batch=32,
         lr=1e-3,
         device=dev,
@@ -972,7 +1251,7 @@ if __name__ == "__main__":
         batch_size=512,
         train_batches_per_iter=50,
         eval_games=50,
-        resume=True,
+        resume=False,
         weight_decay=1e-4,
         grad_clip=1.0,
         policy_weight=1.0,

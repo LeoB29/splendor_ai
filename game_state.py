@@ -71,6 +71,18 @@ class GameState:
         self.pending_round_end: bool = False
         # Debug guard so we only log one snapshot per state when there are no legal actions
         self._no_legal_logged: bool = False
+        # Track initial token supply (per color) to enforce conservation
+        try:
+            supply = {c: int(tokens.get(c, 0)) for c in GEM_COLORS}
+            for p in players:
+                for c in GEM_COLORS:
+                    supply[c] += int(p.tokens.get(c, 0))
+            self._initial_supply = supply  # type: ignore[attr-defined]
+            # Gold supply as well (optional)
+            self._initial_gold = int(tokens.get('gold', 0)) + sum(int(p.tokens.get('gold', 0)) for p in players)  # type: ignore[attr-defined]
+        except Exception:
+            self._initial_supply = {c: 0 for c in GEM_COLORS}  # type: ignore[attr-defined]
+            self._initial_gold = int(tokens.get('gold', 0))  # type: ignore[attr-defined]
 
     def clone(self):
         return deepcopy(self)
@@ -99,6 +111,29 @@ class GameState:
         # Clamp player tokens
         for p in self.players:
             self._clamp_tokens_nonnegative(p.tokens)
+        # Enforce per-player token cap (10) by auto-returning excess to bank (gold first, then highest counts)
+        try:
+            for i, p in enumerate(self.players):
+                total = p.total_tokens()
+                if total > 10:
+                    excess = total - 10
+                    order = ['gold'] + GEM_COLORS  # prefer returning gold first
+                    # Re-order colors (after gold) by current count desc
+                    order = ['gold'] + [c for c, _ in sorted(((c, p.tokens.get(c, 0)) for c in GEM_COLORS), key=lambda t: t[1], reverse=True)]
+                    for c in order:
+                        if excess <= 0:
+                            break
+                        have = int(p.tokens.get(c, 0))
+                        if have <= 0:
+                            continue
+                        give = min(have, excess)
+                        p.tokens[c] = have - give
+                        self.tokens[c] = int(self.tokens.get(c, 0)) + give
+                        excess -= give
+                    if (getattr(self, 'debug', False) or DEBUG_GUARDS):
+                        self._dbg(f"[AutoReturn] Player {i} returned to cap; now total={p.total_tokens()}")
+        except Exception:
+            pass
         # Ensure visible board doesn't exceed 4 per tier and remove None placeholders
         try:
             for t in list(self.board.keys()):
@@ -108,6 +143,68 @@ class GameState:
                 self.board[t] = cards
         except Exception:
             pass
+        # Conservation: bank + players should equal initial supply per colored token
+        try:
+            supply = getattr(self, '_initial_supply', None)
+            if supply:
+                for c in GEM_COLORS:
+                    players_sum = sum(int(p.tokens.get(c, 0)) for p in self.players)
+                    total = int(self.tokens.get(c, 0)) + players_sum
+                    target = int(supply.get(c, 0))
+                    if total != target:
+                        # Reconcile by adjusting bank to match initial supply
+                        fix = max(0, target - players_sum)
+                        if fix != int(self.tokens.get(c, 0)):
+                            if getattr(self, 'debug', False) or DEBUG_GUARDS:
+                                self._dbg(f"[Conserve] Adjust bank {c}: {self.tokens.get(c,0)} -> {fix} (players={players_sum}, target={target})")
+                            self.tokens[c] = fix
+            # Optional: gold conservation (may change with different rules, so only adjust if mismatch is small)
+            try:
+                target_gold = int(getattr(self, '_initial_gold', 0))
+                players_gold = sum(int(p.tokens.get('gold', 0)) for p in self.players)
+                total_gold = int(self.tokens.get('gold', 0)) + players_gold
+                if target_gold and total_gold != target_gold:
+                    fixg = max(0, target_gold - players_gold)
+                    self.tokens['gold'] = fixg
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ------------------ Debug integrity checks (enabled when state.debug or DEBUG_GUARDS) ------------------
+    def _debug_check_integrity(self) -> None:
+        if not (getattr(self, 'debug', False) or DEBUG_GUARDS):
+            return
+        # Non-negative counts
+        for k, v in self.tokens.items():
+            assert v >= 0, f"[Assert] Bank {k} negative: {v}"
+        for i, p in enumerate(self.players):
+            for k, v in p.tokens.items():
+                assert v >= 0, f"[Assert] Player {i} {k} negative: {v}"
+            # Token cap per player
+            assert p.total_tokens() <= 10, f"[Assert] Player {i} exceeds 10 tokens: {p.total_tokens()}"
+        # Board integrity: <=4 visible and no None
+        for t, cards in self.board.items():
+            assert len(cards) <= 4, f"[Assert] Tier {t} has >4 cards: {len(cards)}"
+            for c in cards:
+                assert c is not None, f"[Assert] Tier {t} has None card"
+        # Conservation per colored gem
+        supply = getattr(self, '_initial_supply', None)
+        if supply:
+            for c in GEM_COLORS:
+                players_sum = sum(int(p.tokens.get(c, 0)) for p in self.players)
+                total = int(self.tokens.get(c, 0)) + players_sum
+                assert total == int(supply.get(c, 0)), (
+                    f"[Assert] Supply mismatch for {c}: bank={self.tokens.get(c,0)} players={players_sum} "
+                    f"total={total} target={supply.get(c,0)}"
+                )
+        # Gold conservation (optional; only check if initial known)
+        if hasattr(self, '_initial_gold'):
+            tg = int(getattr(self, '_initial_gold', 0))
+            if tg > 0:
+                pg = sum(int(p.tokens.get('gold', 0)) for p in self.players)
+                totg = int(self.tokens.get('gold', 0)) + pg
+                assert totg == tg, f"[Assert] Gold mismatch: bank={self.tokens.get('gold',0)} players={pg} total={totg} target={tg}"
 
     def get_legal_actions(self):
         actions = []
@@ -214,12 +311,15 @@ class GameState:
                 bank_ge4 = [c for c in colors if self.tokens.get(c, 0) >= 4]
                 board_sizes = {t: len(cs) for t, cs in self.board.items()}
                 deck_sizes = {t: len(ds) for t, ds in self.deck.items()}
+                other_idx = (self.current_player + 1) % len(self.players)
+                other_player = self.players[other_idx]
                 print(
-                    "[NoLegal] p=%d bank=%s p_tokens=%s bonuses=%s reserved=%d can_reserve=%s colors_avail=%s bank_ge4=%s board=%s deck=%s"
+                    "[NoLegal] p=%d bank=%s p_tokens=%s opp_tokens=%s bonuses=%s reserved=%d can_reserve=%s colors_avail=%s bank_ge4=%s board=%s deck=%s"
                     % (
                         self.current_player,
                         dict(self.tokens),
                         dict(player.tokens),
+                        dict(other_player.tokens),
                         dict(player.bonuses),
                         len(player.reserved),
                         player.can_reserve(),
@@ -401,9 +501,29 @@ class GameState:
                     new_state.nobles.remove(noble)
                     break  # only one noble visit
 
+        # Debug: verify integrity before global invariants adjust (to catch issues early)
+        try:
+            new_state._debug_check_integrity()
+        except AssertionError as e:
+            # Re-raise to make failures visible in debug mode
+            raise
+
         new_state.current_player = (new_state.current_player + 1) % len(new_state.players)
         # Safety: never allow negative counts in bank or player tokens (including gold).
         new_state._enforce_invariants()
+        # Lightweight runtime warning for token-cap breaches (non-fatal), post-fix
+        try:
+            warned = getattr(new_state, '_cap_warned', False)
+            if not warned:
+                for i, p in enumerate(new_state.players):
+                    tt = p.total_tokens()
+                    if tt > 10:
+                        at = getattr(action, 'action_type', '?')
+                        print(f"[Warn] Token cap breach: player {i} has {tt} tokens after {at}")
+                        new_state._cap_warned = True
+                        break
+        except Exception:
+            pass
         # Official Splendor end condition: if any player has >=15 points, finish the round
         # so that all players have played the same number of turns, then pick winner with
         # tie-break on fewest purchased cards.
