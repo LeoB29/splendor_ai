@@ -43,5 +43,7 @@ if __name__ == "__main__":
         temp_final=0.0,
         temp_moves=15,
         compile_model=False,
+        res_blocks=6,
+        width=512,
+        big_eval_every=0,  # disable heavy eval in smoke run
     )
-

@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.optim as optim
 from typing import Any
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import multiprocessing as mp
+import io
 
 #DEBUG
 #import game_state as GS
@@ -457,9 +459,9 @@ class AlphaZeroMCTS:
         self._root = child if child is not None else None
 
 
-def _load_ckpt_model(path: str, device: Any, input_size: int, action_size: int) -> Optional[PolicyValueNet]:
+def _load_ckpt_model(path: str, device: Any, input_size: int, action_size: int, width: int = 512, res_blocks: int = 6) -> Optional[PolicyValueNet]:
     try:
-        model = PolicyValueNet(input_size=input_size, action_size=action_size).to(device)
+        model = PolicyValueNet(input_size=input_size, action_size=action_size, width=width, n_blocks=res_blocks).to(device)
         try:
             ck = torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
         except TypeError:
@@ -605,6 +607,70 @@ def compute_targets(trajectory: List[Sample], winner: int) -> Tuple[torch.Tensor
         z = [1.0 if t.player == winner else -1.0 for t in trajectory]
         Z = torch.tensor(z, dtype=torch.float32)
     return X, P, Z
+
+
+# -----------------------------
+# Parallel self-play helpers
+# -----------------------------
+_SP_MODEL: Optional[PolicyValueNet] = None
+_SP_DEVICE: Any = "cpu"
+
+
+def _sp_init(model_bytes: bytes, input_size: int, action_size: int, width: int, res_blocks: int, device_str: str) -> None:
+    """Initializer for worker processes: reconstruct model once per process."""
+    global _SP_MODEL, _SP_DEVICE
+    # Resolve device from string; fallback to CPU if unavailable
+    dev: Any = "cpu"
+    try:
+        if device_str.startswith("cuda") and torch.cuda.is_available():
+            dev = torch.device("cuda")
+        elif device_str.startswith("cpu"):
+            dev = "cpu"
+        else:
+            dev = "cpu"
+    except Exception:
+        dev = "cpu"
+    _SP_DEVICE = dev
+    # Rebuild model and load weights
+    m = PolicyValueNet(input_size=input_size, action_size=action_size, width=width, n_blocks=res_blocks)
+    buf = io.BytesIO(model_bytes)
+    try:
+        state = torch.load(buf, map_location='cpu', weights_only=False)  # state_dict bytes
+    except Exception:
+        state = torch.load(buf, map_location='cpu')
+    try:
+        m.load_state_dict(state)
+    except Exception:
+        # Best-effort non-strict for potential arch drift
+        m.load_state_dict(state, strict=False)
+    _SP_MODEL = m.to(dev).eval()
+
+
+def _sp_run(args: Tuple[int, float, float, float, int, bool, int, Optional[int]]) -> Tuple[List[Sample], int]:
+    """Run one self-play episode using the global model.
+
+    Args: (mcts_simulations, temperature, temp_init, temp_final, temp_moves, add_dirichlet, mcts_batch, seed)
+    """
+    (mcts_simulations, temperature, temp_init, temp_final, temp_moves, add_dirichlet, mcts_batch, seed) = args
+    if seed is not None:
+        try:
+            random.seed(seed)
+            np.random.seed(seed % (2**32 - 1))
+            torch.manual_seed(seed)
+        except Exception:
+            pass
+    assert _SP_MODEL is not None
+    return self_play_episode(
+        _SP_MODEL,
+        mcts_simulations=mcts_simulations,
+        device=_SP_DEVICE,
+        temperature=temperature,
+        temp_init=temp_init,
+        temp_final=temp_final,
+        temp_moves=temp_moves,
+        add_dirichlet=add_dirichlet,
+        mcts_batch=mcts_batch,
+    )
 
 
 def train_on_batch(model: PolicyValueNet, optimizer: optim.Optimizer, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], device: Any = "cpu",
@@ -909,19 +975,32 @@ def az_train(
     warmup_iters: int = 2,
     entropy_init: float = 0.01,
     entropy_anneal_iters: int = 8,
+    # Model architecture
+    width: int = 512,
+    res_blocks: int = 6,
+    # Logging verbosity: print last N CSV lines at iter end (0 disables)
+    log_print_tail: int = 5,
+    # Periodic big evaluation
+    big_eval_every: int = 5,
+    big_eval_games: int = 200,
+    # Parallel self-play
+    selfplay_workers: int = 0,
+    selfplay_device: Optional[str] = None,
 ):
     # Setup
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "train_log.csv")
     write_header = not os.path.exists(log_path)
+    big_eval_path = os.path.join(log_dir, "eval_big.csv")
+    big_write_header = not os.path.exists(big_eval_path)
 
     # Infer input size
     dummy_state = setup_game(num_players=2)
     input_size = len(flatten_game_state(dummy_state))
     action_size = 43
 
-    model = PolicyValueNet(input_size=input_size, action_size=action_size).to(device)
+    model = PolicyValueNet(input_size=input_size, action_size=action_size, width=width, n_blocks=res_blocks).to(device)
     # Optional: compile model (PyTorch 2.x) for speed
     if compile_model and hasattr(torch, "compile"):
         try:
@@ -1078,22 +1157,88 @@ def az_train(
         it = start_iter_global + step
         step_counts: List[int] = []
         print(f"[Iter {it}] Self-play: {games_per_iter} games")
-        for g in range(games_per_iter):
-            traj, winner = self_play_episode(
-                model,
-                mcts_simulations=mcts_simulations,
-                device=device,
-                temperature=1.0,
-                temp_init=temp_init,
-                temp_final=temp_final,
-                temp_moves=temp_moves,
-                add_dirichlet=True,
-                mcts_batch=mcts_batch,
-            )
-            X, P, Z = compute_targets(traj, winner)
-            buffer.add(X, P, Z)
-            step_counts.append(len(traj))
-            print(f"[Iter {it}] Self-play {g+1}/{games_per_iter} steps={len(traj)}")
+        if int(selfplay_workers) and int(selfplay_workers) > 1:
+            # Prepare model bytes for workers (state_dict only)
+            try:
+                sd = model.state_dict()
+                buf = io.BytesIO()
+                torch.save(sd, buf)
+                model_bytes = buf.getvalue()
+            except Exception:
+                # Fallback: no parallel if serialization fails
+                model_bytes = None
+            if model_bytes is None:
+                workers = 1
+            else:
+                workers = min(int(selfplay_workers), int(games_per_iter))
+            if workers > 1 and model_bytes is not None:
+                dev_str = "cpu"
+                try:
+                    if selfplay_device is not None:
+                        dev_str = str(selfplay_device)
+                    else:
+                        if (isinstance(device, torch.device) and device.type == "cuda") or (isinstance(device, str) and str(device).startswith("cuda")):
+                            dev_str = "cuda"
+                        elif isinstance(device, str) and device == "cpu":
+                            dev_str = "cpu"
+                        else:
+                            dev_str = "cpu"  # default to CPU for portability
+                except Exception:
+                    dev_str = "cpu"
+                # Spawn pool with safe 'spawn' context for Windows
+                try:
+                    ctx = mp.get_context("spawn")
+                except Exception:
+                    ctx = mp
+                with ctx.Pool(processes=workers, initializer=_sp_init,
+                              initargs=(model_bytes, input_size, action_size, width, res_blocks, dev_str)) as pool:
+                    # Prepare per-game args
+                    base_seed = random.randint(1, 10_000_000)
+                    args_list = [
+                        (mcts_simulations, 1.0, float(temp_init), float(temp_final), int(temp_moves), True, int(mcts_batch), base_seed + i)
+                        for i in range(games_per_iter)
+                    ]
+                    for idx, (traj, winner) in enumerate(pool.imap_unordered(_sp_run, args_list), start=1):
+                        X, P, Z = compute_targets(traj, winner)
+                        buffer.add(X, P, Z)
+                        step_counts.append(len(traj))
+                        print(f"[Iter {it}] Self-play {idx}/{games_per_iter} steps={len(traj)}")
+            else:
+                # Fallback to sequential if workers <=1 or serialization failed
+                for g in range(games_per_iter):
+                    traj, winner = self_play_episode(
+                        model,
+                        mcts_simulations=mcts_simulations,
+                        device=device,
+                        temperature=1.0,
+                        temp_init=temp_init,
+                        temp_final=temp_final,
+                        temp_moves=temp_moves,
+                        add_dirichlet=True,
+                        mcts_batch=mcts_batch,
+                    )
+                    X, P, Z = compute_targets(traj, winner)
+                    buffer.add(X, P, Z)
+                    step_counts.append(len(traj))
+                    print(f"[Iter {it}] Self-play {g+1}/{games_per_iter} steps={len(traj)}")
+        else:
+            # Sequential self-play
+            for g in range(games_per_iter):
+                traj, winner = self_play_episode(
+                    model,
+                    mcts_simulations=mcts_simulations,
+                    device=device,
+                    temperature=1.0,
+                    temp_init=temp_init,
+                    temp_final=temp_final,
+                    temp_moves=temp_moves,
+                    add_dirichlet=True,
+                    mcts_batch=mcts_batch,
+                )
+                X, P, Z = compute_targets(traj, winner)
+                buffer.add(X, P, Z)
+                step_counts.append(len(traj))
+                print(f"[Iter {it}] Self-play {g+1}/{games_per_iter} steps={len(traj)}")
 
         # Train from replay buffer
         losses = []
@@ -1187,7 +1332,7 @@ def az_train(
                 else:
                     dummy_state = setup_game(num_players=2)
                     input_size2 = len(flatten_game_state(dummy_state))
-                    opp_model = _load_ckpt_model(champ_path, device, input_size2, action_size)
+                    opp_model = _load_ckpt_model(champ_path, device, input_size2, action_size, width=width, res_blocks=res_blocks)
                     if opp_model is not None:
                         wr, margin = arena_vs_model(model, opp_model, games=gate_games, sims=max(16, mcts_simulations // 2), device=device, mcts_batch=mcts_batch)
                         print(f"[Gate] vs champion: win%={wr:.1%} margin={margin:.2f}")
@@ -1224,12 +1369,52 @@ def az_train(
             f"win%_rand={win_rate:.1%} win%_greedy={win_g:.1%} margin_g={margin_g:.2f} len_g={len_g:.1f}"
         )
 
-        # Display the full training log so far (including both win rates)
+        # Print only a short tail of the CSV log for readability
         try:
-            with open(log_path, "r") as f:
-                print("[TrainLog]\n" + f.read().rstrip())
+            if int(log_print_tail) > 0:
+                with open(log_path, "r") as f:
+                    lines = [ln.rstrip("\n") for ln in f]
+                if lines:
+                    header = lines[0]
+                    tail_n = max(1, int(log_print_tail))
+                    tail = lines[-tail_n:]
+                    print("[TrainLogTail]")
+                    print(header)
+                    for ln in tail:
+                        print(ln)
         except Exception:
             pass
+
+        # Periodic big evaluation (low-variance)
+        try:
+            if int(big_eval_every) > 0 and (it % int(big_eval_every) == 0):
+                print(f"[BigEval] Iter {it}: running {big_eval_games} games (random + greedy)")
+                big_wr = evaluate_vs_random(
+                    model,
+                    games=int(big_eval_games),
+                    mcts_simulations=mcts_simulations,
+                    device=device,
+                    mcts_batch=mcts_batch,
+                )
+                big_wg, big_margin, big_len = evaluate_vs_greedy(
+                    model,
+                    games=int(big_eval_games),
+                    mcts_simulations=mcts_simulations,
+                    device=device,
+                    mcts_batch=mcts_batch,
+                )
+                with open(big_eval_path, "a", newline="") as bf:
+                    bw = csv.writer(bf)
+                    if big_write_header:
+                        bw.writerow(["iter", "games", "win_rand", "win_greedy", "margin_g", "len_g"])
+                        big_write_header = False
+                    bw.writerow([it, int(big_eval_games), f"{big_wr:.3f}", f"{big_wg:.3f}", f"{big_margin:.3f}", f"{big_len:.2f}"])
+                print(
+                    f"[BigEval] iter={it} games={int(big_eval_games)} "
+                    f"rand={big_wr:.1%} greedy={big_wg:.1%} margin_g={big_margin:.2f} len_g={big_len:.1f}"
+                )
+        except Exception as e:
+            print(f"[BigEval] failed: {e}")
 
     return model
 
@@ -1239,32 +1424,85 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         dev = torch.device("cuda")
         print("[Device] Using CUDA GPU")
+        # CUDA-friendly default (e.g., T4 16GB): single GPU worker, larger mcts_batch
+        az_train(
+            iterations=10,
+            games_per_iter=16,
+            mcts_simulations=256,
+            mcts_batch=96,
+            lr=1e-3,
+            device=dev,
+            replay_capacity=30000,
+            batch_size=512,
+            train_batches_per_iter=20,
+            eval_games=20,
+            resume=False,
+            weight_decay=1e-4,
+            grad_clip=1.0,
+            policy_weight=1.0,
+            value_weight=1.0,
+            temp_init=1.0,
+            temp_final=0.0,
+            temp_moves=20,
+            compile_model=False,
+            res_blocks=6,
+            width=512,
+            selfplay_workers=1,
+            selfplay_device='cuda',
+        )
     elif DML_DEVICE is not None:
         dev = DML_DEVICE
         print("[Device] Using DirectML (AMD/Intel GPU)")
+        # DML-friendly: sequential self-play on CPU-like path, moderate batch
+        az_train(
+            iterations=10,
+            games_per_iter=8,
+            mcts_simulations=256,
+            mcts_batch=32,
+            lr=1e-3,
+            device=dev,
+            replay_capacity=30000,
+            batch_size=512,
+            train_batches_per_iter=20,
+            eval_games=10,
+            resume=False,
+            weight_decay=1e-4,
+            grad_clip=1.0,
+            policy_weight=1.0,
+            value_weight=1.0,
+            temp_init=1.0,
+            temp_final=0.0,
+            temp_moves=20,
+            compile_model=False,
+            res_blocks=6,
+            width=512,
+            selfplay_workers=0,
+        )
     else:
         dev = "cpu"
         print("[Device] Using CPU")
-
-    # Example stronger run (residual width=512, full-sim eval)
-    az_train(
-        iterations=10,
-        games_per_iter=8,
-        mcts_simulations=256,
-        mcts_batch=32,
-        lr=1e-3,
-        device=dev,
-        replay_capacity=30000,
-        batch_size=512,
-        train_batches_per_iter=50,
-        eval_games=50,
-        resume=False,
-        weight_decay=1e-4,
-        grad_clip=1.0,
-        policy_weight=1.0,
-        value_weight=1.0,
-        temp_init=1.0,
-        temp_final=0.0,
-        temp_moves=20,
-        compile_model=False,
-    )
+        # CPU-friendly: small mcts_batch and fewer train batches
+        az_train(
+            iterations=10,
+            games_per_iter=8,
+            mcts_simulations=128,
+            mcts_batch=32,
+            lr=1e-3,
+            device=dev,
+            replay_capacity=20000,
+            batch_size=256,
+            train_batches_per_iter=15,
+            eval_games=10,
+            resume=False,
+            weight_decay=1e-4,
+            grad_clip=1.0,
+            policy_weight=1.0,
+            value_weight=1.0,
+            temp_init=1.0,
+            temp_final=0.0,
+            temp_moves=20,
+            compile_model=False,
+            res_blocks=6,
+            width=512,
+            selfplay_workers=0,
+        )
