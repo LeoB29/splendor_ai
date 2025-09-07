@@ -1,0 +1,32 @@
+- Quand on achète une carte : il faudrait rajouter des actions pour savoir quelles gemmes dépenser (gold ou pas ...)
+- print action taken in GUI for debug
+- shouldn't be possible to have no legal actions in monte carlo
+
+Pb : 
+n'arrivent pas à acheter d'autres cartes que tier 1
+commence toujours par réserver tier 3
+
+
+
+
+
+OK --- Populate full deck with right format
+OK --- Vérifier que les règles sont correctes (limite de 10 jetons etc...)
+
+
+
+Legal actions:
+- Buy board card, 9 max
+- Buy reserved card, 3 max
+- Take tokens, if total tokens <= 7 
+	- Combinatoire parmi 5 piles max, soit 10 actions max
+	- Deux de la même gemme si bank >=4, 5 max
+
+- Take tokens, if total tokens > 7
+	- Pour chacune des 10 prises possibles, il y aura au max 1200 choix
+		- (si j'ai 10 jetons en banque et que j'en rejette autant que j'en prends, dans une situation où les 5 couleurs sont dispos en banque commune)
+		- pour 9 jetons, je descends à 450, pour 8 je descends à 100
+
+- Reserve a card, if total tokens = 10 
+	- Il y a 72 échanges possibles dans cette configuration
+

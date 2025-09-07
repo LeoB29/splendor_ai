@@ -53,3 +53,21 @@
 - Champion (if gating): `checkpoints/champion.pt`
 - Logs: `logs/train_log.csv` (iter, buffer, avg_steps, loss, policy_loss, value_loss, win_rand, win_greedy, margin_g, len_g)
 
+
+## Updates (2025-09-06 PM)
+- Training/Model (`alpha_zero.py`)
+  - Configurable residual net: add `width` and `res_blocks` to `az_train`; default 6 blocks on CUDA, adjusted to 4 on DirectML for throughput.
+  - Device-tuned defaults in `__main__` for CUDA (e.g., T4), DirectML, and CPU, balancing self-play vs training.
+  - Parallel self-play (multiprocessing): new `selfplay_workers` and `selfplay_device` (supports `'cpu'`/`'cuda'`). DML workers fall back to CPU.
+  - BigEval: periodic large evaluation with `big_eval_every` and `big_eval_games`; results saved to `logs/eval_big.csv` and printed.
+  - Trimmed end-of-iteration print: show only a short CSV tail via `log_print_tail`.
+- DirectML profile updates
+  - Switched to `res_blocks=4`, `mcts_simulations≈192`, `mcts_batch=32`, more self-play (`games_per_iter≈32`), fewer train batches to reduce overfitting on slow inference.
+- Logging/Eval
+  - BigEval summary prints the CSV row and path for easy copy/paste.
+- Testing
+  - New `test_invariants.py`: token transfer guards, auto-cap to 10 (gold-first), conservation, board integrity, and action mask roundtrip/exclusions.
+  - Added `pytest.ini` to ignore `backup/`, `old/`, `logs/`, etc.; full suite now clean (23 tests passing).
+- Notes
+  - On CUDA, prefer 1 GPU worker with larger `mcts_batch` (e.g., 96–128). On DML, use sequential self-play (workers=0) and keep `mcts_batch≈32`.
+  - Champion gating remains optional; recommended after 5–10 warmup iterations or with lighter gates (100–150 games, ~0.55–0.57 threshold).

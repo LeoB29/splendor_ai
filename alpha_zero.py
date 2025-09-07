@@ -1413,6 +1413,13 @@ def az_train(
                     f"[BigEval] iter={it} games={int(big_eval_games)} "
                     f"rand={big_wr:.1%} greedy={big_wg:.1%} margin_g={big_margin:.2f} len_g={big_len:.1f}"
                 )
+                # Confirm save location and echo the CSV row for easy copying
+                try:
+                    print(f"[BigEvalSaved] {big_eval_path}")
+                    print(f"iter,games,win_rand,win_greedy,margin_g,len_g")
+                    print(f"{it},{int(big_eval_games)},{big_wr:.3f},{big_wg:.3f},{big_margin:.3f},{big_len:.2f}")
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[BigEval] failed: {e}")
 
@@ -1425,17 +1432,18 @@ if __name__ == "__main__":
         dev = torch.device("cuda")
         print("[Device] Using CUDA GPU")
         # CUDA-friendly default (e.g., T4 16GB): single GPU worker, larger mcts_batch
+        # Rationale: fewer train batches (16) reduce early overfit; eval_games=50 stabilizes the eval signal
         az_train(
             iterations=10,
-            games_per_iter=16,
+            games_per_iter=32,
             mcts_simulations=256,
             mcts_batch=96,
-            lr=1e-3,
+            lr=5e-4,
             device=dev,
             replay_capacity=30000,
             batch_size=512,
-            train_batches_per_iter=20,
-            eval_games=20,
+            train_batches_per_iter=16,
+            eval_games=50,
             resume=False,
             weight_decay=1e-4,
             grad_clip=1.0,
@@ -1449,6 +1457,9 @@ if __name__ == "__main__":
             width=512,
             selfplay_workers=1,
             selfplay_device='cuda',
+            warmup_iters=4,
+            entropy_init=0.02,
+            entropy_anneal_iters=12,
         )
     elif DML_DEVICE is not None:
         dev = DML_DEVICE
@@ -1456,15 +1467,15 @@ if __name__ == "__main__":
         # DML-friendly: sequential self-play on CPU-like path, moderate batch
         az_train(
             iterations=10,
-            games_per_iter=8,
-            mcts_simulations=256,
+            games_per_iter=40,
+            mcts_simulations=192,
             mcts_batch=32,
-            lr=1e-3,
+            lr=5e-4,
             device=dev,
             replay_capacity=30000,
             batch_size=512,
-            train_batches_per_iter=20,
-            eval_games=10,
+            train_batches_per_iter=10,
+            eval_games=12,
             resume=False,
             weight_decay=1e-4,
             grad_clip=1.0,
@@ -1472,11 +1483,14 @@ if __name__ == "__main__":
             value_weight=1.0,
             temp_init=1.0,
             temp_final=0.0,
-            temp_moves=20,
+            temp_moves=30,
             compile_model=False,
-            res_blocks=6,
+            res_blocks=4,
             width=512,
             selfplay_workers=0,
+            warmup_iters=4,
+            entropy_init=0.04,
+            entropy_anneal_iters=20,
         )
     else:
         dev = "cpu"
@@ -1484,14 +1498,14 @@ if __name__ == "__main__":
         # CPU-friendly: small mcts_batch and fewer train batches
         az_train(
             iterations=10,
-            games_per_iter=8,
+            games_per_iter=16,
             mcts_simulations=128,
             mcts_batch=32,
-            lr=1e-3,
+            lr=5e-4,
             device=dev,
             replay_capacity=20000,
             batch_size=256,
-            train_batches_per_iter=15,
+            train_batches_per_iter=12,
             eval_games=10,
             resume=False,
             weight_decay=1e-4,
@@ -1505,4 +1519,7 @@ if __name__ == "__main__":
             res_blocks=6,
             width=512,
             selfplay_workers=0,
+            warmup_iters=4,
+            entropy_init=0.02,
+            entropy_anneal_iters=12,
         )
