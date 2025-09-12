@@ -529,6 +529,7 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
     trajectory: List[Sample] = []
     consecutive_passes = 0
     move_idx = 0
+    ended_by_pass = False
 
     while not state.is_terminal:
         # If no legal actions, pass the turn (as in game_sim)
@@ -538,6 +539,7 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
             consecutive_passes += 1
             # End if both players consecutively have no moves
             if consecutive_passes >= len(state.players):
+                ended_by_pass = True
                 break
             continue
         consecutive_passes = 0
@@ -594,7 +596,20 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
                 pass
         move_idx += 1
 
-    winner = state.winner if state.winner is not None else -1
+    if state.winner is not None:
+        winner = state.winner
+    elif ended_by_pass:
+        # Provisional winner on pass-break only: highest points, then fewest purchased cards
+        max_pts = max(p.points for p in state.players)
+        candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
+        if len(candidates) == 1:
+            winner = candidates[0]
+        else:
+            fewest_cards = min(len(state.players[i].cards) for i in candidates)
+            tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
+            winner = tied[0] if len(tied) == 1 else -1
+    else:
+        winner = -1
     return trajectory, winner
 
 
@@ -794,13 +809,17 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
         my_index = g % 2
         move_count = 0
         consecutive_passes = 0
+        ended_by_pass = False
         while not state.is_terminal:
             legal = state.get_legal_actions()
             if not legal:
                 state.current_player = (state.current_player + 1) % len(state.players)
                 consecutive_passes += 1
                 # Break stalemates where neither player has legal moves
-                if consecutive_passes >= len(state.players) or move_count >= max_moves:
+                if consecutive_passes >= len(state.players):
+                    ended_by_pass = True
+                    break
+                if move_count >= max_moves:
                     break
                 continue
             played_a_idx: Optional[int] = None
@@ -828,7 +847,18 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
                     mcts.reuse_after_play(played_a_idx)
                 except Exception:
                     pass
-        if state.winner == my_index:
+        winner_idx = state.winner
+        if winner_idx is None and ended_by_pass:
+            # Provisional winner on pass-break only
+            max_pts = max(p.points for p in state.players)
+            candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
+            if len(candidates) == 1:
+                winner_idx = candidates[0]
+            else:
+                fewest_cards = min(len(state.players[i].cards) for i in candidates)
+                tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
+                winner_idx = tied[0] if len(tied) == 1 else None
+        if winner_idx == my_index:
             wins += 1
         # Lightweight eval progress
         interval = max(1, games // 10)
@@ -905,12 +935,14 @@ def evaluate_vs_greedy(model: PolicyValueNet, games: int = 50, mcts_simulations:
         my_index = g % 2
         move_count = 0
         consecutive_passes = 0
+        ended_by_pass = False
         while not state.is_terminal and move_count < max_moves:
             legal = state.get_legal_actions()
             if not legal:
                 state.current_player = (state.current_player + 1) % len(state.players)
                 consecutive_passes += 1
                 if consecutive_passes >= len(state.players):
+                    ended_by_pass = True
                     break
                 continue
             if state.current_player == my_index:
@@ -931,7 +963,18 @@ def evaluate_vs_greedy(model: PolicyValueNet, games: int = 50, mcts_simulations:
         my_pts = state.players[my_index].points
         opp_pts = state.players[1 - my_index].points
         margins.append(my_pts - opp_pts)
-        if state.winner == my_index:
+        winner_idx = state.winner
+        if winner_idx is None and ended_by_pass:
+            # Provisional winner on pass-break only
+            max_pts = max(p.points for p in state.players)
+            candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
+            if len(candidates) == 1:
+                winner_idx = candidates[0]
+            else:
+                fewest_cards = min(len(state.players[i].cards) for i in candidates)
+                tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
+                winner_idx = tied[0] if len(tied) == 1 else None
+        if winner_idx == my_index:
             wins += 1
         # progress
         interval = max(1, games // 10)
@@ -962,6 +1005,9 @@ def az_train(
     grad_clip: float = 1.0,
     policy_weight: float = 1.0,
     value_weight: float = 1.0,
+    # Value warmup (optional): if >0, use value_warmup_weight for first N global iterations
+    value_warmup_iters: int = 0,
+    value_warmup_weight: float = 1.5,
     temp_init: float = 1.0,
     temp_final: float = 0.0,
     temp_moves: int = 20,
@@ -1262,6 +1308,14 @@ def az_train(
                     scheduler.step()
                 except Exception:
                     pass
+        # Determine effective value weight (warmup for early global iterations)
+        eff_value_weight = value_weight
+        try:
+            if int(value_warmup_iters) > 0 and it <= int(value_warmup_iters):
+                eff_value_weight = float(value_warmup_weight)
+        except Exception:
+            eff_value_weight = value_weight
+
         for bi in range(train_batches_per_iter):
             if buffer.size() == 0:
                 break
@@ -1272,7 +1326,7 @@ def az_train(
                 batch,
                 device=device,
                 policy_weight=policy_weight,
-                value_weight=value_weight,
+                value_weight=eff_value_weight,
                 grad_clip=grad_clip,
                 scaler=scaler,
                 entropy_coef=ent_coef,
@@ -1435,12 +1489,12 @@ if __name__ == "__main__":
         # Rationale: fewer train batches (16) reduce early overfit; eval_games=50 stabilizes the eval signal
         az_train(
             iterations=10,
-            games_per_iter=32,
+            games_per_iter=48,
             mcts_simulations=256,
             mcts_batch=96,
             lr=5e-4,
             device=dev,
-            replay_capacity=30000,
+            replay_capacity=50000,
             batch_size=512,
             train_batches_per_iter=16,
             eval_games=50,
@@ -1449,9 +1503,11 @@ if __name__ == "__main__":
             grad_clip=1.0,
             policy_weight=1.0,
             value_weight=1.0,
+            value_warmup_iters=3,
+            value_warmup_weight=1.5,
             temp_init=1.0,
             temp_final=0.0,
-            temp_moves=20,
+            temp_moves=25,
             compile_model=False,
             res_blocks=6,
             width=512,
@@ -1467,20 +1523,22 @@ if __name__ == "__main__":
         # DML-friendly: sequential self-play on CPU-like path, moderate batch
         az_train(
             iterations=10,
-            games_per_iter=40,
-            mcts_simulations=192,
+            games_per_iter=60,
+            mcts_simulations=256,
             mcts_batch=32,
             lr=5e-4,
             device=dev,
-            replay_capacity=30000,
+            replay_capacity=50000,
             batch_size=512,
-            train_batches_per_iter=10,
+            train_batches_per_iter=8,
             eval_games=12,
-            resume=False,
+            resume=True,
             weight_decay=1e-4,
             grad_clip=1.0,
             policy_weight=1.0,
             value_weight=1.0,
+            value_warmup_iters=3,
+            value_warmup_weight=1.5,
             temp_init=1.0,
             temp_final=0.0,
             temp_moves=30,
