@@ -34,12 +34,12 @@ def main():
     print(f"Self-play OK. Steps={len(traj)}, winner={winner}")
 
     # 4) Build training targets and train one batch
-    X, P, Z = compute_targets(traj, winner)
+    X, P, Z, ret_actions, ret_cands, ret_probs = compute_targets(traj, winner)
     assert X.ndim == 2 and P.ndim == 2 and Z.ndim == 1, "Targets shapes are incorrect"
     assert X.size(0) == P.size(0) == Z.size(0), "Batch dims mismatch"
 
     opt = optim.Adam(model.parameters(), lr=1e-3)
-    stats = train_on_batch(model, opt, (X, P, Z))
+    stats = train_on_batch(model, opt, (X, P, Z, ret_actions, ret_cands, ret_probs))
     print("Train step OK.", stats)
 
 

@@ -105,25 +105,48 @@ def _model_state_dict_cpu(model: nn.Module) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Policy + Value Network (MLP)
+# Policy + Value Network (Attention)
 # -----------------------------
-class ResidualBlock(nn.Module):
-    def __init__(self, width: int):
-        super().__init__()
-        self.fc1 = nn.Linear(width, width)
-        self.fc2 = nn.Linear(width, width)
+class AttentionBlock(nn.Module):
+    """Pre-LN transformer encoder block for set-like game entities."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = torch.relu(self.fc1(x))
-        h = self.fc2(h)
-        return torch.relu(x + h)
+    def __init__(self, width: int, n_heads: int, dropout: float = 0.05):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(width)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=width,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ln2 = nn.LayerNorm(width)
+        self.ff = nn.Sequential(
+            nn.Linear(width, width * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(width * 4, width),
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        h = self.ln1(x)
+        attn_out, _ = self.attn(
+            h,
+            h,
+            h,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = x + self.drop(attn_out)
+        x = x + self.drop(self.ff(self.ln2(x)))
+        return x
 
 
 class PolicyValueNet(nn.Module):
-    """Permutation-equivariant encoder for card sets + global features.
+    """Token-attention encoder for Splendor entities.
 
-    This preserves action index alignment while reducing sensitivity to card order
-    by using shared card encoders and pooled global context.
+    We keep the same fixed 43-action head interface while replacing pooled MLP
+    context with cross-entity attention over cards, nobles, players, and bank.
     """
 
     def __init__(self, input_size: int, action_size: int = 43, width: int = 512, n_blocks: int = 4):
@@ -131,66 +154,102 @@ class PolicyValueNet(nn.Module):
         self.action_size = action_size
         self.input_size = input_size
         self.num_players = self._infer_num_players(input_size)
+        self.width = int(width)
 
-        # Embedding sizes
-        card_dim = max(64, width // 2)
-        player_dim = max(32, width // 4)
-        bank_dim = max(32, width // 4)
+        # Sequence layout (fixed for action alignment and stable decoding)
+        self.n_board = NUM_TIERS * CARDS_PER_TIER
+        self.n_res_self = RESERVED_PER_PLAYER
+        self.n_nobles = NOBLES_MAX
+        self.seq_len = 1 + self.n_board + self.n_res_self + self.n_nobles + 4
+        # CLS + board + self reserved + nobles + (self player, opp player, bank, opp reserved pool)
 
-        # Encoders
+        n_heads = self._pick_num_heads(self.width)
+
+        # Entity encoders
         self.card_encoder = nn.Sequential(
-            nn.Linear(CARD_VEC_LEN, card_dim),
-            nn.ReLU(),
-            nn.Linear(card_dim, card_dim),
-            nn.ReLU(),
+            nn.Linear(CARD_VEC_LEN, self.width),
+            nn.GELU(),
+            nn.Linear(self.width, self.width),
         )
         self.noble_encoder = nn.Sequential(
-            nn.Linear(5, card_dim),
-            nn.ReLU(),
-            nn.Linear(card_dim, card_dim),
-            nn.ReLU(),
+            nn.Linear(5, self.width),
+            nn.GELU(),
+            nn.Linear(self.width, self.width),
         )
         self.player_encoder = nn.Sequential(
-            nn.Linear(12, player_dim),  # 6 tokens + 5 bonuses + 1 points
-            nn.ReLU(),
-            nn.Linear(player_dim, player_dim),
-            nn.ReLU(),
+            nn.Linear(12, self.width),  # 6 tokens + 5 bonuses + 1 points
+            nn.GELU(),
+            nn.Linear(self.width, self.width),
         )
         self.bank_encoder = nn.Sequential(
-            nn.Linear(6, bank_dim),
-            nn.ReLU(),
-            nn.Linear(bank_dim, bank_dim),
-            nn.ReLU(),
+            nn.Linear(6, self.width),
+            nn.GELU(),
+            nn.Linear(self.width, self.width),
         )
 
-        # Global context MLP
-        global_in = card_dim * 4 + player_dim * 2 + bank_dim
-        self.global_in = nn.Linear(global_in, width)
-        self.blocks = nn.ModuleList([ResidualBlock(width) for _ in range(max(1, int(n_blocks)))])
+        # Learned token metadata
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.width))
+        self.board_pos = nn.Parameter(torch.zeros(1, self.n_board, self.width))
+        self.res_pos = nn.Parameter(torch.zeros(1, self.n_res_self, self.width))
+        self.noble_pos = nn.Parameter(torch.zeros(1, self.n_nobles, self.width))
+        self.type_emb = nn.Embedding(8, self.width)
+        # 0 cls, 1 board, 2 self-res, 3 nobles, 4 self-player, 5 opp-player, 6 bank, 7 opp-res-pool
+
+        self.blocks = nn.ModuleList([AttentionBlock(self.width, n_heads=n_heads) for _ in range(max(1, int(n_blocks)))])
+        self.final_ln = nn.LayerNorm(self.width)
 
         # Policy heads
-        self.policy_global = nn.Linear(width, 16)  # 15 token actions + 1 take-gold
-        head_in = width + card_dim
-        self.policy_buy = nn.Sequential(nn.Linear(head_in, width // 2), nn.ReLU(), nn.Linear(width // 2, 1))
-        self.policy_reserve = nn.Sequential(nn.Linear(head_in, width // 2), nn.ReLU(), nn.Linear(width // 2, 1))
-        self.policy_buy_reserved = nn.Sequential(nn.Linear(head_in, width // 2), nn.ReLU(), nn.Linear(width // 2, 1))
+        self.policy_global = nn.Linear(self.width, 16)  # 15 token actions + 1 take-gold
+        head_in = self.width * 2
+        self.policy_buy = nn.Sequential(
+            nn.Linear(head_in, self.width),
+            nn.GELU(),
+            nn.Linear(self.width, 1),
+        )
+        self.policy_reserve = nn.Sequential(
+            nn.Linear(head_in, self.width),
+            nn.GELU(),
+            nn.Linear(self.width, 1),
+        )
+        self.policy_buy_reserved = nn.Sequential(
+            nn.Linear(head_in, self.width),
+            nn.GELU(),
+            nn.Linear(self.width, 1),
+        )
 
         # Return-choice head: scores candidate return vectors for a given base action
-        action_emb_dim = max(16, width // 16)
+        action_emb_dim = max(16, self.width // 16)
         self.return_action_embed = nn.Embedding(action_size, action_emb_dim)
         self.return_head = nn.Sequential(
-            nn.Linear(width + action_emb_dim + 6, width // 2),
-            nn.ReLU(),
-            nn.Linear(width // 2, 1),
+            nn.Linear(self.width + action_emb_dim + 6, self.width // 2),
+            nn.GELU(),
+            nn.Linear(self.width // 2, 1),
         )
 
         # Value head
         self.value_head = nn.Sequential(
-            nn.Linear(width, width // 2),
-            nn.ReLU(),
-            nn.Linear(max(1, width // 2), 1),
+            nn.Linear(self.width, self.width // 2),
+            nn.GELU(),
+            nn.Linear(max(1, self.width // 2), 1),
             nn.Tanh(),
         )
+
+        self._init_parameters()
+
+    def _init_parameters(self) -> None:
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.board_pos, mean=0.0, std=0.02)
+        nn.init.normal_(self.res_pos, mean=0.0, std=0.02)
+        nn.init.normal_(self.noble_pos, mean=0.0, std=0.02)
+        nn.init.normal_(self.type_emb.weight, mean=0.0, std=0.02)
+
+    @staticmethod
+    def _pick_num_heads(width: int) -> int:
+        # Pick the largest standard head count that divides width.
+        for h in (16, 12, 8, 6, 4, 3, 2, 1):
+            if width % h == 0:
+                return h
+        return 1
 
     @staticmethod
     def _infer_num_players(input_size: int) -> int:
@@ -205,18 +264,23 @@ class PolicyValueNet(nn.Module):
 
     @staticmethod
     def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, D), mask: (B, N)
-        m = mask.unsqueeze(-1)
+        # x: (B, N, D), mask: (B, N) with True for valid tokens
+        m = mask.to(dtype=x.dtype).unsqueeze(-1)
         denom = m.sum(dim=1).clamp(min=1.0)
         return (x * m).sum(dim=1) / denom
+
+    def _type(self, bsz: int, type_id: int, count: int, device: torch.device) -> torch.Tensor:
+        ids = torch.full((bsz, count), int(type_id), device=device, dtype=torch.long)
+        return self.type_emb(ids)
 
     def forward(self, x: torch.Tensor, return_features: bool = False):
         bsz = x.shape[0]
         n_players = self.num_players
+        device = x.device
 
         idx = 0
-        board_len = NUM_TIERS * CARDS_PER_TIER * CARD_VEC_LEN
-        board = x[:, idx: idx + board_len].view(bsz, NUM_TIERS * CARDS_PER_TIER, CARD_VEC_LEN)
+        board_len = self.n_board * CARD_VEC_LEN
+        board = x[:, idx: idx + board_len].view(bsz, self.n_board, CARD_VEC_LEN)
         idx += board_len
 
         reserved_len = n_players * RESERVED_PER_PLAYER * CARD_VEC_LEN
@@ -233,62 +297,97 @@ class PolicyValueNet(nn.Module):
         nobles_len = NOBLES_MAX * 5
         nobles = x[:, idx: idx + nobles_len].view(bsz, NOBLES_MAX, 5)
 
-        # Masks for empty cards/nobles
-        board_mask = (board.abs().sum(dim=-1) > 0).float()
-        res_mask = (reserved.abs().sum(dim=-1) > 0).float()
-        noble_mask = (nobles.abs().sum(dim=-1) > 0).float()
+        # Valid-token masks (True = valid)
+        board_valid = (board.abs().sum(dim=-1) > 0)
+        res_valid = (reserved.abs().sum(dim=-1) > 0)
+        noble_valid = (nobles.abs().sum(dim=-1) > 0)
 
-        # Encode cards
-        board_emb = self.card_encoder(board) * board_mask.unsqueeze(-1)
-        res_flat = reserved.view(bsz, n_players * RESERVED_PER_PLAYER, CARD_VEC_LEN)
-        res_emb = self.card_encoder(res_flat).view(bsz, n_players, RESERVED_PER_PLAYER, -1)
-        res_emb = res_emb * res_mask.unsqueeze(-1)
-        noble_emb = self.noble_encoder(nobles) * noble_mask.unsqueeze(-1)
+        # Base encodings
+        board_tok = self.card_encoder(board)
+        self_res = reserved[:, 0]
+        self_res_tok = self.card_encoder(self_res)
+        noble_tok = self.noble_encoder(nobles)
+        self_player_tok = self.player_encoder(players[:, 0]).unsqueeze(1)
+        bank_tok = self.bank_encoder(bank).unsqueeze(1)
 
-        # Pools
-        board_pool = self._masked_mean(board_emb, board_mask)
-        res_pool_cur = self._masked_mean(res_emb[:, 0], res_mask[:, 0])
+        # Opponent aggregates (robust to >2 players)
         if n_players > 1:
-            res_pool_opp = self._masked_mean(res_emb[:, 1], res_mask[:, 1])
-            player_opp = self.player_encoder(players[:, 1])
+            opp_players = players[:, 1:]
+            opp_player_tok = self.player_encoder(opp_players.reshape(-1, 12)).view(bsz, n_players - 1, self.width).mean(dim=1, keepdim=True)
+            opp_res = reserved[:, 1:].reshape(bsz, (n_players - 1) * RESERVED_PER_PLAYER, CARD_VEC_LEN)
+            opp_res_valid = res_valid[:, 1:].reshape(bsz, (n_players - 1) * RESERVED_PER_PLAYER)
+            opp_res_tok_raw = self.card_encoder(opp_res)
+            opp_res_pool = self._masked_mean(opp_res_tok_raw, opp_res_valid).unsqueeze(1)
         else:
-            res_pool_opp = torch.zeros_like(res_pool_cur)
-            player_opp = torch.zeros_like(player_cur)
-        nobles_pool = self._masked_mean(noble_emb, noble_mask)
+            opp_player_tok = torch.zeros_like(self_player_tok)
+            opp_res_pool = torch.zeros_like(self_player_tok)
 
-        # Player + bank encodings
-        player_cur = self.player_encoder(players[:, 0])
-        bank_emb = self.bank_encoder(bank)
+        # Add position + type metadata
+        board_tok = board_tok + self.board_pos + self._type(bsz, 1, self.n_board, device)
+        self_res_tok = self_res_tok + self.res_pos + self._type(bsz, 2, self.n_res_self, device)
+        noble_tok = noble_tok + self.noble_pos + self._type(bsz, 3, self.n_nobles, device)
+        self_player_tok = self_player_tok + self._type(bsz, 4, 1, device)
+        opp_player_tok = opp_player_tok + self._type(bsz, 5, 1, device)
+        bank_tok = bank_tok + self._type(bsz, 6, 1, device)
+        opp_res_pool = opp_res_pool + self._type(bsz, 7, 1, device)
+        cls_tok = self.cls_token.expand(bsz, -1, -1) + self._type(bsz, 0, 1, device)
 
-        # Global context
-        global_in = torch.cat([board_pool, res_pool_cur, res_pool_opp, nobles_pool, player_cur, player_opp, bank_emb], dim=-1)
-        h = torch.relu(self.global_in(global_in))
+        # Build token sequence
+        seq = torch.cat(
+            [
+                cls_tok,             # 0
+                board_tok,           # 1..12
+                self_res_tok,        # 13..15
+                noble_tok,           # 16..25
+                self_player_tok,     # 26
+                opp_player_tok,      # 27
+                bank_tok,            # 28
+                opp_res_pool,        # 29
+            ],
+            dim=1,
+        )
+
+        # key_padding_mask: True means "ignore this token in attention"
+        pad_mask = torch.cat(
+            [
+                torch.zeros(bsz, 1, dtype=torch.bool, device=device),      # cls
+                ~board_valid,                                              # board
+                ~res_valid[:, 0],                                          # self reserved
+                ~noble_valid,                                              # nobles
+                torch.zeros(bsz, 4, dtype=torch.bool, device=device),      # player/bank/pool tokens
+            ],
+            dim=1,
+        )
+
         for blk in self.blocks:
-            h = blk(h)
+            seq = blk(seq, key_padding_mask=pad_mask)
+        seq = self.final_ln(seq)
 
-        # Policy: global actions
-        global_logits = self.policy_global(h)
+        cls = seq[:, 0]
+        board_ctx = seq[:, 1: 1 + self.n_board]
+        self_res_ctx = seq[:, 1 + self.n_board: 1 + self.n_board + self.n_res_self]
 
-        # Policy: per-card actions (equivariant to card order)
-        h_exp = h.unsqueeze(1).expand(-1, board_emb.size(1), -1)
-        buy_vis = self.policy_buy(torch.cat([board_emb, h_exp], dim=-1)).squeeze(-1)
-        reserve_vis = self.policy_reserve(torch.cat([board_emb, h_exp], dim=-1)).squeeze(-1)
+        # Policy heads
+        global_logits = self.policy_global(cls)
 
-        res_cur = res_emb[:, 0]
-        h_res = h.unsqueeze(1).expand(-1, res_cur.size(1), -1)
-        buy_res = self.policy_buy_reserved(torch.cat([res_cur, h_res], dim=-1)).squeeze(-1)
+        cls_board = cls.unsqueeze(1).expand(-1, self.n_board, -1)
+        buy_vis = self.policy_buy(torch.cat([board_ctx, cls_board], dim=-1)).squeeze(-1)
+        reserve_vis = self.policy_reserve(torch.cat([board_ctx, cls_board], dim=-1)).squeeze(-1)
+
+        cls_res = cls.unsqueeze(1).expand(-1, self.n_res_self, -1)
+        buy_res = self.policy_buy_reserved(torch.cat([self_res_ctx, cls_res], dim=-1)).squeeze(-1)
 
         # Assemble logits in fixed action order
-        logits = torch.zeros(bsz, self.action_size, device=x.device, dtype=x.dtype)
+        logits = torch.zeros(bsz, self.action_size, device=device, dtype=x.dtype)
         logits[:, 0:15] = global_logits[:, 0:15]
         logits[:, 15:27] = buy_vis
         logits[:, 27:30] = buy_res
         logits[:, 30:42] = reserve_vis
         logits[:, 42] = global_logits[:, 15]
 
-        value = self.value_head(h).squeeze(-1)
+        value = self.value_head(cls).squeeze(-1)
         if return_features:
-            return logits, value, h
+            return logits, value, cls
         return logits, value
 
     def score_return_candidates(self, h: torch.Tensor, action_idx: int, return_vecs: torch.Tensor) -> torch.Tensor:
@@ -305,7 +404,6 @@ class PolicyValueNet(nn.Module):
         a_emb = self.return_action_embed(a_idx).expand(k, -1)
         feats = torch.cat([h_exp, a_emb, return_vecs], dim=-1)
         return self.return_head(feats).squeeze(-1)
-
 
 def _card_short(card: Optional[Card]) -> str:
     if card is None:
@@ -2616,3 +2714,4 @@ if __name__ == "__main__":
             entropy_init=0.02,
             entropy_anneal_iters=12,
         )
+

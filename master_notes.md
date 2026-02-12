@@ -1,6 +1,52 @@
 # Master Notes
 Log of changes and rationale (most recent first).
 
+## 2026-02-12
+### Attention architecture migration (attention branch)
+- Replaced the pooled/residual MLP encoder in `alpha_zero.py::PolicyValueNet` with a transformer-style token-attention encoder.
+- Added `AttentionBlock` (pre-LN multi-head self-attention + FFN) and stacked it in `PolicyValueNet`.
+- New entity-token design:
+  - `CLS` token (global context)
+  - board cards (12 tokens)
+  - current-player reserved cards (3 tokens)
+  - nobles (10 tokens)
+  - current-player token
+  - opponent aggregate player token
+  - bank token
+  - opponent reserved aggregate token
+- Added learned type embeddings and position embeddings for board/reserved/noble slots.
+- Preserved all external training/search interfaces:
+  - fixed 43-action policy head layout unchanged
+  - value head output unchanged
+  - return-choice head (`score_return_candidates`) unchanged at API level
+  - `return_features=True` still returns `(logits, value, h)` where `h` is now the CLS embedding.
+
+### Why this change
+- Splendor state is naturally set-structured with many interacting visible entities.
+- Attention allows richer cross-entity interactions than pooled MLP context while keeping the existing action encoding stable.
+
+### Quick validation performed
+- `python -m py_compile alpha_zero.py train_dml.py run_fast.py run_fast_cuda.py train_cuda.py` passed.
+- `python -m pytest -q test_nn_io.py` passed (`4 passed`).
+- Direct forward sanity check passed: policy/value/feature shapes are correct.
+- Tiny end-to-end training sanity run passed (`az_train` with 1 iteration, 2 games, tiny MCTS/config), confirming self-play + train + eval loop compatibility with the new attention model.
+- Tiny DirectML sanity run also passed on this branch (`az_train` with 1 game / 1 batch), confirming attention forward+train compatibility on your AMD path (with expected Adam `aten::lerp` CPU fallback warning from DirectML).
+
+### Notes
+- Updated `test_alpha_zero_smoke.py` for current `compute_targets(...)` return arity; smoke script now passes end-to-end.
+- Checkpoints from prior non-attention architecture are generally not shape-compatible; attention runs should start fresh or resume from attention-generated checkpoints.
+### Training + Benchmark tooling
+- Added `train_attention_dml.py`:
+  - Dedicated DirectML launcher for attention architecture.
+  - Includes `stable` and `progress` profiles with attention-safe defaults and existing gate/divergence controls.
+- Added `benchmark_attention_vs_baseline.py`:
+  - Runs reproducible, fixed-seed comparisons between attention and baseline repos.
+  - Auto-discovers latest checkpoints (prefers `*_model.pt` when available).
+  - Reports win-rate deltas vs random/greedy, margin deltas, and Elo-proxy deltas.
+  - Saves full JSON reports in `logs/benchmark_attention_vs_baseline_*.json`.
+- Smoke benchmark executed successfully (tiny config):
+  - Command: `python benchmark_attention_vs_baseline.py --seeds 0 --games-random 2 --games-greedy 2 --mcts-simulations 16 --mcts-batch 8 --device cpu`
+  - Result snapshot: attention and baseline tied on win rate in this tiny test; attention had better greedy margin (`+4.0`).
 ## 2026-02-10
 ### Recovery profile hardening + run clarity
 - **Stricter RECOVERY defaults** (`train_dml.py`):
@@ -220,3 +266,4 @@ Log of changes and rationale (most recent first).
 ### Commands run (high-level)
 - `conda env update -f environment.yml --prune`
 - `conda run -n splendor_ai python -c "import alpha_zero, nn_input_output"`
+
