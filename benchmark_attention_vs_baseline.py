@@ -85,6 +85,24 @@ from alpha_zero import PolicyValueNet, evaluate_vs_random, evaluate_vs_greedy, _
 cfg = json.loads(os.environ["BENCH_CFG"])
 
 
+def _resolve_device(name: str):
+    s = str(name).strip().lower()
+    if s.startswith("cuda") and torch.cuda.is_available():
+        return torch.device("cuda")
+    if s in ("cpu", ""):
+        return torch.device("cpu")
+    if s in ("dml", "directml"):
+        try:
+            import torch_directml as _dml  # type: ignore
+            return _dml.device()
+        except Exception:
+            return torch.device("cpu")
+    try:
+        return torch.device(name)
+    except Exception:
+        return torch.device("cpu")
+
+
 def _load_checkpoint(path: str):
     p = path
     ck = None
@@ -128,6 +146,7 @@ def _infer_model_dims(sd: dict):
 
 sd = _load_checkpoint(cfg["ckpt"])
 width, n_blocks = _infer_model_dims(sd)
+dev = _resolve_device(cfg.get("device", "cpu"))
 
 s0 = setup_game(num_players=2)
 in_size = len(flatten_game_state(s0))
@@ -136,7 +155,7 @@ try:
     model.load_state_dict(sd)
 except Exception:
     model.load_state_dict(sd, strict=False)
-model.eval()
+model = model.to(dev).eval()
 
 seeds = [int(x) for x in cfg["seeds"]]
 metrics = []
@@ -148,7 +167,7 @@ for s in seeds:
         model,
         games=int(cfg["games_random"]),
         mcts_simulations=int(cfg["mcts_simulations"]),
-        device=cfg["device"],
+        device=dev,
         mcts_batch=int(cfg["mcts_batch"]),
         max_moves=int(cfg["max_moves"]),
     ))
@@ -161,7 +180,7 @@ for s in seeds:
         model,
         games=int(cfg["games_greedy"]),
         mcts_simulations=int(cfg["mcts_simulations"]),
-        device=cfg["device"],
+        device=dev,
         mcts_batch=int(cfg["mcts_batch"]),
         max_moves=int(cfg["max_moves"]),
     )
@@ -187,7 +206,7 @@ result = {
     "games_greedy": int(cfg["games_greedy"]),
     "mcts_simulations": int(cfg["mcts_simulations"]),
     "mcts_batch": int(cfg["mcts_batch"]),
-    "device": cfg["device"],
+    "device": str(dev),
     "win_rand_mean": float(arr_wr_r.mean()) if len(arr_wr_r) else 0.0,
     "win_rand_std": float(arr_wr_r.std()) if len(arr_wr_r) else 0.0,
     "win_greedy_mean": float(arr_wr_g.mean()) if len(arr_wr_g) else 0.0,
@@ -333,3 +352,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
