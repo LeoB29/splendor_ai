@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project artifacts
+checkpoints/
+logs/
+backup/
+
+# Local docs and large files
+docs/
+*.docx
+
+# Temp
+*.tmp
+*.log
+temp.text
+TDL.txt

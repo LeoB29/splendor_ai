@@ -1,7 +1,9 @@
 import math
+import hashlib
 import os
 import csv
 import random
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -13,6 +15,7 @@ from typing import Any
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import multiprocessing as mp
 import io
+import copy
 
 #DEBUG
 #import game_state as GS
@@ -26,8 +29,79 @@ except Exception:
     DML_DEVICE = None
 
 from game_state import GameState, Action, Card, PlayerState
-from nn_input_output import flatten_game_state, legal_actions_mask, index_to_action
+from nn_input_output import (
+    flatten_game_state,
+    legal_actions_mask,
+    index_to_action,
+    flatten_visible_cards,
+    permute_colors_in_flat_state,
+    permute_policy_colors,
+    permute_action_index,
+    permute_token_vector,
+    CARD_VEC_LEN,
+    NUM_TIERS,
+    CARDS_PER_TIER,
+    RESERVED_PER_PLAYER,
+    NOBLES_MAX,
+)
 from cards_init import setup_game
+
+
+def _allowlist_checkpoint_globals() -> None:
+    """Allowlist legacy tensor/numpy rebuild globals for safe checkpoint loading."""
+    try:
+        from torch.serialization import add_safe_globals  # type: ignore
+    except Exception:
+        return
+    globs: list[Any] = []
+    # Torch legacy tensor rebuild helpers
+    try:
+        from torch._utils import _rebuild_device_tensor_from_numpy  # type: ignore
+        globs.append(_rebuild_device_tensor_from_numpy)
+    except Exception:
+        pass
+    # NumPy legacy pickle globals seen in some checkpoints
+    try:
+        from numpy.core.multiarray import _reconstruct  # type: ignore
+        globs.append(_reconstruct)
+    except Exception:
+        pass
+    try:
+        globs.append(np.ndarray)
+    except Exception:
+        pass
+    try:
+        globs.append(np.dtype)
+    except Exception:
+        pass
+    # Newer NumPy exposes concrete dtype classes (e.g., Float32DType) in pickles.
+    try:
+        globs.append(type(np.dtype(np.float32)))
+    except Exception:
+        pass
+    # Python codec helper seen in some serialized storages.
+    try:
+        from _codecs import encode as _codecs_encode  # type: ignore
+        globs.append(_codecs_encode)
+    except Exception:
+        pass
+    if globs:
+        try:
+            add_safe_globals(globs)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+
+def _model_state_dict_cpu(model: nn.Module) -> Dict[str, Any]:
+    """Return a CPU-only copy of model state_dict for portable safe loading."""
+    sd = model.state_dict()
+    out: Dict[str, Any] = {}
+    for k, v in sd.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.detach().cpu()
+        else:
+            out[k] = v
+    return out
 
 
 # -----------------------------
@@ -46,25 +120,238 @@ class ResidualBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
+    """Permutation-equivariant encoder for card sets + global features.
+
+    This preserves action index alignment while reducing sensitivity to card order
+    by using shared card encoders and pooled global context.
+    """
+
     def __init__(self, input_size: int, action_size: int = 43, width: int = 512, n_blocks: int = 4):
         super().__init__()
-        self.inp = nn.Linear(input_size, width)
+        self.action_size = action_size
+        self.input_size = input_size
+        self.num_players = self._infer_num_players(input_size)
+
+        # Embedding sizes
+        card_dim = max(64, width // 2)
+        player_dim = max(32, width // 4)
+        bank_dim = max(32, width // 4)
+
+        # Encoders
+        self.card_encoder = nn.Sequential(
+            nn.Linear(CARD_VEC_LEN, card_dim),
+            nn.ReLU(),
+            nn.Linear(card_dim, card_dim),
+            nn.ReLU(),
+        )
+        self.noble_encoder = nn.Sequential(
+            nn.Linear(5, card_dim),
+            nn.ReLU(),
+            nn.Linear(card_dim, card_dim),
+            nn.ReLU(),
+        )
+        self.player_encoder = nn.Sequential(
+            nn.Linear(12, player_dim),  # 6 tokens + 5 bonuses + 1 points
+            nn.ReLU(),
+            nn.Linear(player_dim, player_dim),
+            nn.ReLU(),
+        )
+        self.bank_encoder = nn.Sequential(
+            nn.Linear(6, bank_dim),
+            nn.ReLU(),
+            nn.Linear(bank_dim, bank_dim),
+            nn.ReLU(),
+        )
+
+        # Global context MLP
+        global_in = card_dim * 4 + player_dim * 2 + bank_dim
+        self.global_in = nn.Linear(global_in, width)
         self.blocks = nn.ModuleList([ResidualBlock(width) for _ in range(max(1, int(n_blocks)))])
-        self.policy_head = nn.Linear(width, action_size)
+
+        # Policy heads
+        self.policy_global = nn.Linear(width, 16)  # 15 token actions + 1 take-gold
+        head_in = width + card_dim
+        self.policy_buy = nn.Sequential(nn.Linear(head_in, width // 2), nn.ReLU(), nn.Linear(width // 2, 1))
+        self.policy_reserve = nn.Sequential(nn.Linear(head_in, width // 2), nn.ReLU(), nn.Linear(width // 2, 1))
+        self.policy_buy_reserved = nn.Sequential(nn.Linear(head_in, width // 2), nn.ReLU(), nn.Linear(width // 2, 1))
+
+        # Return-choice head: scores candidate return vectors for a given base action
+        action_emb_dim = max(16, width // 16)
+        self.return_action_embed = nn.Embedding(action_size, action_emb_dim)
+        self.return_head = nn.Sequential(
+            nn.Linear(width + action_emb_dim + 6, width // 2),
+            nn.ReLU(),
+            nn.Linear(width // 2, 1),
+        )
+
+        # Value head
         self.value_head = nn.Sequential(
             nn.Linear(width, width // 2),
             nn.ReLU(),
             nn.Linear(max(1, width // 2), 1),
-            nn.Tanh(),  # value in [-1, 1]
+            nn.Tanh(),
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = torch.relu(self.inp(x))
+    @staticmethod
+    def _infer_num_players(input_size: int) -> int:
+        board_len = NUM_TIERS * CARDS_PER_TIER * CARD_VEC_LEN
+        nobles_len = NOBLES_MAX * 5
+        bank_len = 6
+        per_player = RESERVED_PER_PLAYER * CARD_VEC_LEN + 12
+        base = board_len + bank_len + nobles_len
+        if input_size >= base and (input_size - base) % per_player == 0:
+            return int((input_size - base) // per_player)
+        return 2
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, D), mask: (B, N)
+        m = mask.unsqueeze(-1)
+        denom = m.sum(dim=1).clamp(min=1.0)
+        return (x * m).sum(dim=1) / denom
+
+    def forward(self, x: torch.Tensor, return_features: bool = False):
+        bsz = x.shape[0]
+        n_players = self.num_players
+
+        idx = 0
+        board_len = NUM_TIERS * CARDS_PER_TIER * CARD_VEC_LEN
+        board = x[:, idx: idx + board_len].view(bsz, NUM_TIERS * CARDS_PER_TIER, CARD_VEC_LEN)
+        idx += board_len
+
+        reserved_len = n_players * RESERVED_PER_PLAYER * CARD_VEC_LEN
+        reserved = x[:, idx: idx + reserved_len].view(bsz, n_players, RESERVED_PER_PLAYER, CARD_VEC_LEN)
+        idx += reserved_len
+
+        player_len = n_players * 12
+        players = x[:, idx: idx + player_len].view(bsz, n_players, 12)
+        idx += player_len
+
+        bank = x[:, idx: idx + 6]
+        idx += 6
+
+        nobles_len = NOBLES_MAX * 5
+        nobles = x[:, idx: idx + nobles_len].view(bsz, NOBLES_MAX, 5)
+
+        # Masks for empty cards/nobles
+        board_mask = (board.abs().sum(dim=-1) > 0).float()
+        res_mask = (reserved.abs().sum(dim=-1) > 0).float()
+        noble_mask = (nobles.abs().sum(dim=-1) > 0).float()
+
+        # Encode cards
+        board_emb = self.card_encoder(board) * board_mask.unsqueeze(-1)
+        res_flat = reserved.view(bsz, n_players * RESERVED_PER_PLAYER, CARD_VEC_LEN)
+        res_emb = self.card_encoder(res_flat).view(bsz, n_players, RESERVED_PER_PLAYER, -1)
+        res_emb = res_emb * res_mask.unsqueeze(-1)
+        noble_emb = self.noble_encoder(nobles) * noble_mask.unsqueeze(-1)
+
+        # Pools
+        board_pool = self._masked_mean(board_emb, board_mask)
+        res_pool_cur = self._masked_mean(res_emb[:, 0], res_mask[:, 0])
+        if n_players > 1:
+            res_pool_opp = self._masked_mean(res_emb[:, 1], res_mask[:, 1])
+            player_opp = self.player_encoder(players[:, 1])
+        else:
+            res_pool_opp = torch.zeros_like(res_pool_cur)
+            player_opp = torch.zeros_like(player_cur)
+        nobles_pool = self._masked_mean(noble_emb, noble_mask)
+
+        # Player + bank encodings
+        player_cur = self.player_encoder(players[:, 0])
+        bank_emb = self.bank_encoder(bank)
+
+        # Global context
+        global_in = torch.cat([board_pool, res_pool_cur, res_pool_opp, nobles_pool, player_cur, player_opp, bank_emb], dim=-1)
+        h = torch.relu(self.global_in(global_in))
         for blk in self.blocks:
             h = blk(h)
-        logits = self.policy_head(h)
+
+        # Policy: global actions
+        global_logits = self.policy_global(h)
+
+        # Policy: per-card actions (equivariant to card order)
+        h_exp = h.unsqueeze(1).expand(-1, board_emb.size(1), -1)
+        buy_vis = self.policy_buy(torch.cat([board_emb, h_exp], dim=-1)).squeeze(-1)
+        reserve_vis = self.policy_reserve(torch.cat([board_emb, h_exp], dim=-1)).squeeze(-1)
+
+        res_cur = res_emb[:, 0]
+        h_res = h.unsqueeze(1).expand(-1, res_cur.size(1), -1)
+        buy_res = self.policy_buy_reserved(torch.cat([res_cur, h_res], dim=-1)).squeeze(-1)
+
+        # Assemble logits in fixed action order
+        logits = torch.zeros(bsz, self.action_size, device=x.device, dtype=x.dtype)
+        logits[:, 0:15] = global_logits[:, 0:15]
+        logits[:, 15:27] = buy_vis
+        logits[:, 27:30] = buy_res
+        logits[:, 30:42] = reserve_vis
+        logits[:, 42] = global_logits[:, 15]
+
         value = self.value_head(h).squeeze(-1)
+        if return_features:
+            return logits, value, h
         return logits, value
+
+    def score_return_candidates(self, h: torch.Tensor, action_idx: int, return_vecs: torch.Tensor) -> torch.Tensor:
+        """Score return candidates given a global state embedding and base action index."""
+        if action_idx is None or action_idx < 0 or action_idx >= self.action_size:
+            return torch.zeros(return_vecs.shape[0], device=return_vecs.device, dtype=return_vecs.dtype)
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+        if return_vecs.dim() == 1:
+            return_vecs = return_vecs.unsqueeze(0)
+        k = return_vecs.shape[0]
+        h_exp = h.expand(k, -1)
+        a_idx = torch.tensor([int(action_idx)], device=h.device, dtype=torch.long)
+        a_emb = self.return_action_embed(a_idx).expand(k, -1)
+        feats = torch.cat([h_exp, a_emb, return_vecs], dim=-1)
+        return self.return_head(feats).squeeze(-1)
+
+
+def _card_short(card: Optional[Card]) -> str:
+    if card is None:
+        return "None"
+    try:
+        return f"t{card.tier} pts={card.points} bonus={card.bonus_color} cost={dict(card.cost)}"
+    except Exception:
+        return "Card(?)"
+
+
+def log_policy_alignment(model: PolicyValueNet, state: GameState, device: Any = "cpu", top_k: int = 3) -> None:
+    """Print per-card logits for a single state to verify slot/action alignment."""
+    was_training = model.training
+    model.eval()
+    try:
+        x = torch.tensor(flatten_game_state(state), dtype=torch.float32, device=device).unsqueeze(0)
+        with torch.no_grad():
+            logits, _ = model(x)
+        l = logits.squeeze(0).detach().cpu().numpy()
+    finally:
+        if was_training:
+            model.train()
+
+    vis = flatten_visible_cards(state)
+    reserved = list(getattr(state.players[state.current_player], "reserved", []))
+
+    print("[PolicyDebug] top token actions")
+    token_idxs = list(range(0, 15)) + [42]
+    toks = sorted([(i, l[i]) for i in token_idxs], key=lambda t: t[1], reverse=True)[: max(1, int(top_k))]
+    for idx, val in toks:
+        print(f"  a={idx:02d} logit={val:+.3f}")
+
+    print("[PolicyDebug] top buy-visible")
+    buy_vis = sorted([(15 + i, l[15 + i], vis[i]) for i in range(len(vis))], key=lambda t: t[1], reverse=True)
+    for idx, val, card in buy_vis[: max(1, int(top_k))]:
+        print(f"  a={idx:02d} logit={val:+.3f} card={_card_short(card)}")
+
+    print("[PolicyDebug] top reserve-visible")
+    res_vis = sorted([(30 + i, l[30 + i], vis[i]) for i in range(len(vis))], key=lambda t: t[1], reverse=True)
+    for idx, val, card in res_vis[: max(1, int(top_k))]:
+        print(f"  a={idx:02d} logit={val:+.3f} card={_card_short(card)}")
+
+    print("[PolicyDebug] buy-reserved slots")
+    for i in range(min(3, len(reserved))):
+        card = reserved[i]
+        print(f"  a={27 + i:02d} logit={l[27 + i]:+.3f} card={_card_short(card)}")
 
 
 def masked_softmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -115,7 +402,8 @@ class AZNode:
 
 class AlphaZeroMCTS:
     def __init__(self, model: PolicyValueNet, device: str = "cpu", c_puct: float = 1.5, n_simulations: int = 100,
-                 dir_alpha: float = 0.3, dir_eps: float = 0.25, returns_top_k: int = 3, mcts_batch: int = 16):
+                 dir_alpha: float = 0.3, dir_eps: float = 0.25, returns_top_k: int = 3, mcts_batch: int = 16,
+                 return_prior_mix: float = 0.8):
         self.model = model
         self.device = device
         self.c_puct = c_puct
@@ -124,6 +412,8 @@ class AlphaZeroMCTS:
         self.dir_eps = dir_eps
         self.returns_top_k = max(1, int(returns_top_k))
         self.mcts_batch = max(1, int(mcts_batch))
+        # Blend learned return-head priors with heuristic priors for stability.
+        self.return_prior_mix = max(0.0, min(1.0, float(return_prior_mix)))
         # Stores best return variant per base action from the last run
         self._last_best_returns: Dict[int, Dict[str, int]] = {}
         # Root for tree reuse across moves
@@ -132,10 +422,68 @@ class AlphaZeroMCTS:
     def get_best_tokens_returned(self, a_idx: int) -> Optional[Dict[str, int]]:
         return self._last_best_returns.get(a_idx)
 
+    def get_return_distribution(self, a_idx: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Return candidate return vectors and MCTS visit-based probs for a base action."""
+        root = self._root
+        if root is None or not root.edges:
+            return None
+        counts: list[int] = []
+        cands: list[list[int]] = []
+        total = 0
+        token_order = ["diamond", "sapphire", "obsidian", "ruby", "emerald", "gold"]
+        for key, e in root.edges.items():
+            base, _var = key
+            if base != a_idx:
+                continue
+            meta = root.edge_meta.get(key, {})
+            ret = meta.get("tokens_returned", {}) if meta else {}
+            vec = [int(ret.get(c, 0)) for c in token_order]
+            cands.append(vec)
+            counts.append(int(e.N))
+            total += int(e.N)
+        if total <= 0 or len(cands) <= 1:
+            return None
+        probs = [c / total for c in counts]
+        return np.array(cands, dtype=np.float32), np.array(probs, dtype=np.float32)
+
+    def _state_signature(self, state: GameState) -> bytes:
+        """Compact signature for detecting stale tree reuse.
+
+        Note: This intentionally omits hidden deck order. Reuse is still safe
+        when the tree advances via its own chosen actions on the same state.
+        """
+        flat = flatten_game_state(state)
+        h = hashlib.blake2b(digest_size=16)
+        h.update(flat.tobytes())
+        # Include terminal bookkeeping that affects end-of-round logic.
+        h.update(bytes([1 if state.is_terminal else 0]))
+        winner = 255 if getattr(state, "winner", None) is None else int(state.winner) & 0xFF
+        h.update(bytes([winner]))
+        h.update(bytes([1 if getattr(state, "pending_round_end", False) else 0]))
+        h.update(bytes([int(getattr(state, "start_player", 0)) & 0xFF]))
+        return h.digest()
+
+    def reset_root(self) -> None:
+        """Drop the cached tree when external moves make it stale."""
+        self._root = None
+
+    def _terminal_value(self, state: GameState) -> float:
+        """Return terminal value from the perspective of state.current_player.
+
+        This ensures MCTS backs up correct outcomes instead of a fixed loss
+        at terminal leaves, which would bias search in the wrong direction.
+        """
+        if not state.is_terminal:
+            return 0.0
+        winner = getattr(state, "winner", None)
+        if winner is None:
+            return 0.0
+        return 1.0 if int(winner) == int(state.current_player) else -1.0
+
     @torch.no_grad()
-    def _evaluate_batch(self, states: List[GameState]) -> Tuple[List[np.ndarray], List[float]]:
+    def _evaluate_batch(self, states: List[GameState]) -> Tuple[List[np.ndarray], List[float], List[torch.Tensor]]:
         if not states:
-            return [], []
+            return [], [], []
         xs = [flatten_game_state(s) for s in states]
         x = torch.tensor(np.stack(xs), dtype=torch.float32, device=self.device)
         # Build masks batch
@@ -146,16 +494,17 @@ class AlphaZeroMCTS:
         if use_cuda:
             try:
                 with torch.amp.autocast('cuda'):  # type: ignore[attr-defined]
-                    logits, values = self.model(x)
+                    logits, values, h = self.model(x, return_features=True)
             except Exception:
                 with torch.cuda.amp.autocast():  # type: ignore[attr-defined]
-                    logits, values = self.model(x)
+                    logits, values, h = self.model(x, return_features=True)
         else:
-            logits, values = self.model(x)
+            logits, values, h = self.model(x, return_features=True)
         priors_t = masked_softmax(logits, masks)  # (B, A)
         priors = [p.detach().cpu().numpy() for p in priors_t]
         vals = [float(v.item()) for v in values]
-        return priors, vals
+        hs = [row.detach() for row in h]
+        return priors, vals, hs
 
     def _select(self, node: AZNode) -> Tuple[int, int]:
         # Pick action index maximizing PUCT
@@ -271,7 +620,53 @@ class AlphaZeroMCTS:
         weights = [1.0 / len(top)] * len(top)
         return top, weights
 
-    def _expand_with_priors(self, node: AZNode, priors: np.ndarray) -> None:
+    @staticmethod
+    def _ret_dict_to_vec(ret: Dict[str, int]) -> List[float]:
+        order = ["diamond", "sapphire", "obsidian", "ruby", "emerald", "gold"]
+        return [float(ret.get(c, 0)) for c in order]
+
+    def _return_variant_weights(
+        self,
+        a_idx: int,
+        variants: List[Dict[str, int]],
+        heuristic_weights: List[float],
+        h: Optional[torch.Tensor],
+    ) -> List[float]:
+        if not variants:
+            return []
+        if len(variants) == 1:
+            return [1.0]
+
+        # Normalize heuristic fallback.
+        hw = np.array(heuristic_weights, dtype=np.float64) if heuristic_weights else np.ones(len(variants), dtype=np.float64)
+        if hw.sum() <= 0:
+            hw = np.ones(len(variants), dtype=np.float64)
+        hw = hw / hw.sum()
+
+        if h is None:
+            return hw.astype(np.float32).tolist()
+
+        try:
+            vecs = torch.tensor(
+                np.array([self._ret_dict_to_vec(v) for v in variants], dtype=np.float32),
+                device=h.device,
+                dtype=h.dtype,
+            )
+            scores = self.model.score_return_candidates(h, a_idx, vecs)
+            probs_t = torch.softmax(scores, dim=-1)
+            probs = probs_t.detach().float().cpu().numpy().astype(np.float64)
+            if not np.isfinite(probs).all() or probs.sum() <= 0:
+                return hw.astype(np.float32).tolist()
+            probs = probs / probs.sum()
+            # Blend model priors with heuristic priors for early-run robustness.
+            mix = self.return_prior_mix
+            blended = mix * probs + (1.0 - mix) * hw
+            blended = blended / max(1e-12, blended.sum())
+            return blended.astype(np.float32).tolist()
+        except Exception:
+            return hw.astype(np.float32).tolist()
+
+    def _expand_with_priors(self, node: AZNode, priors: np.ndarray, h: Optional[torch.Tensor] = None) -> None:
         node.priors = priors
         legal_mask = legal_actions_mask(node.state)
         for a_idx, legal in enumerate(legal_mask):
@@ -280,7 +675,8 @@ class AlphaZeroMCTS:
             base_p = float(priors[a_idx])
             variants, weights = self._enumerate_return_variants(node.state, a_idx)
             if variants:
-                for r_idx, (ret, w) in enumerate(zip(variants, weights), start=0):
+                learned_weights = self._return_variant_weights(a_idx, variants, weights, h)
+                for r_idx, (ret, w) in enumerate(zip(variants, learned_weights), start=0):
                     key = (a_idx, r_idx)
                     node.edges[key] = EdgeStats(P=base_p * float(w))
                     node.edge_meta[key] = {"tokens_returned": ret}
@@ -299,13 +695,18 @@ class AlphaZeroMCTS:
         return node.state.apply_action(action)
 
     def run(self, root_state: GameState, temperature: float = 1.0, add_dirichlet: bool = False) -> Tuple[np.ndarray, int]:
-        # Use reused root if it matches the external state; otherwise create a new root
-        root = self._root if self._root is not None else AZNode(root_state)
+        # Use reused root only if it matches the external state signature
+        root_sig = self._state_signature(root_state)
+        root = self._root
+        if root is None or getattr(root, "signature", None) != root_sig:
+            root = AZNode(root_state)
+            root.signature = root_sig  # type: ignore[attr-defined]
+            self._root = root
         # If not expanded yet, expand via batch path
         if not root.is_expanded():
-            priors, vals = self._evaluate_batch([root.state])
+            priors, vals, hs = self._evaluate_batch([root.state])
             v0 = vals[0] if vals else 0.0
-            self._expand_with_priors(root, priors[0])
+            self._expand_with_priors(root, priors[0], hs[0] if hs else None)
         # Optional Dirichlet noise for exploration at root (self-play)
         if add_dirichlet and root.edges:
             actions = list(root.edges.keys())
@@ -321,14 +722,18 @@ class AlphaZeroMCTS:
             s = mixed_base.sum()
             if s > 0:
                 mixed_base = mixed_base / s
-            # Redistribute mixed base priors uniformly across variants of each base action
+            # Redistribute mixed base priors while preserving variant proportions.
             for a, mb in zip(base_actions, mixed_base):
                 variants = [k for k in actions if k[0] == a]
                 if not variants:
                     continue
-                per = float(mb) / len(variants)
-                for key in variants:
-                    root.edges[key].P = per
+                old = np.array([max(0.0, float(root.edges[key].P)) for key in variants], dtype=np.float64)
+                if old.sum() <= 0:
+                    old = np.ones(len(variants), dtype=np.float64) / float(len(variants))
+                else:
+                    old = old / old.sum()
+                for key, w in zip(variants, old):
+                    root.edges[key].P = float(mb) * float(w)
 
         # Simulations with batched leaf evaluation
         sims_done = 0
@@ -345,12 +750,14 @@ class AlphaZeroMCTS:
                     path.append((node, key))
                     if key not in node.children:
                         next_state = self._step(node, key)
-                        node.children[key] = AZNode(next_state)
+                        child = AZNode(next_state)
+                        child.signature = self._state_signature(next_state)  # type: ignore[attr-defined]
+                        node.children[key] = child
                     node = node.children[key]
 
                 # Terminal: immediate backup
                 if node.state.is_terminal:
-                    v = -1.0
+                    v = self._terminal_value(node.state)
                     for parent, key in reversed(path):
                         e = parent.edges[key]
                         e.N += 1
@@ -369,9 +776,9 @@ class AlphaZeroMCTS:
 
             # Batch evaluate collected leaves
             if pending_nodes:
-                priors_list, vals_list = self._evaluate_batch([n.state for n in pending_nodes])
-                for node, path, priors, v in zip(pending_nodes, pending_paths, priors_list, vals_list):
-                    self._expand_with_priors(node, priors)
+                priors_list, vals_list, hs_list = self._evaluate_batch([n.state for n in pending_nodes])
+                for node, path, priors, v, h in zip(pending_nodes, pending_paths, priors_list, vals_list, hs_list):
+                    self._expand_with_priors(node, priors, h)
                     # Backup
                     val = float(v)
                     for parent, key in reversed(path):
@@ -460,18 +867,34 @@ class AlphaZeroMCTS:
 
 
 def _load_ckpt_model(path: str, device: Any, input_size: int, action_size: int, width: int = 512, res_blocks: int = 6) -> Optional[PolicyValueNet]:
-    try:
-        model = PolicyValueNet(input_size=input_size, action_size=action_size, width=width, n_blocks=res_blocks).to(device)
+    candidates: List[str] = [path]
+    # Fallback from legacy full checkpoint path to model-only path.
+    if isinstance(path, str) and path.endswith(".pt") and not path.endswith("_model.pt"):
+        model_only = path[:-3] + "_model.pt"
+        if os.path.exists(model_only):
+            candidates.append(model_only)
+
+    last_err: Optional[Exception] = None
+    for cand in candidates:
         try:
-            ck = torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
-        except TypeError:
-            ck = torch.load(path, map_location='cpu')
-        sd = ck.get("model", ck)
-        model.load_state_dict(sd)
-        return model.to(device)
-    except Exception as e:
-        print(f"[Arena] Failed loading model from {path}: {e}")
-        return None
+            model = PolicyValueNet(input_size=input_size, action_size=action_size, width=width, n_blocks=res_blocks).to(device)
+            # Safe-only loader for mixed checkpoint formats (CPU/CUDA/DirectML).
+            try:
+                ck = torch.load(cand, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
+            except Exception:
+                # Some checkpoints may require allowing legacy tensor/NumPy rebuild globals.
+                _allowlist_checkpoint_globals()
+                ck = torch.load(cand, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
+            sd = ck.get("model", ck)
+            model.load_state_dict(sd)
+            if cand != path:
+                print(f"[Arena] Loaded fallback model-only checkpoint: {cand}")
+            return model.to(device)
+        except Exception as e:
+            last_err = e
+
+    print(f"[Arena] Failed loading model from {path}: {last_err}")
+    return None
 
 
 def arena_vs_model(model: PolicyValueNet, opp: PolicyValueNet, games: int = 100, sims: int = 64, device: Any = "cpu", mcts_batch: int = 16, max_moves: int = 250) -> tuple[float, float]:
@@ -487,6 +910,9 @@ def arena_vs_model(model: PolicyValueNet, opp: PolicyValueNet, games: int = 100,
             legal = state.get_legal_actions()
             if not legal:
                 state.current_player = (state.current_player + 1) % len(state.players)
+                # External state change without an encoded action: tree is stale.
+                mcts_me.reset_root()
+                mcts_opp.reset_root()
                 continue
             if state.current_player == my_index:
                 _, a_idx = mcts_me.run(state, temperature=0.0)
@@ -494,12 +920,30 @@ def arena_vs_model(model: PolicyValueNet, opp: PolicyValueNet, games: int = 100,
                 best_ret = mcts_me.get_best_tokens_returned(a_idx)
                 if best_ret is not None and hasattr(a, "tokens_returned"):
                     a.tokens_returned = best_ret
+                # Reuse only for the MCTS that selected the action.
+                if a_idx != -1:
+                    try:
+                        mcts_me.reuse_after_play(a_idx)
+                    except Exception:
+                        mcts_me.reset_root()
+                else:
+                    mcts_me.reset_root()
+                # Opponent tree is stale (its variant choice may differ).
+                mcts_opp.reset_root()
             else:
                 _, a_idx = mcts_opp.run(state, temperature=0.0)
                 a = index_to_action(a_idx, state) if a_idx != -1 else legal[0]
                 best_ret = mcts_opp.get_best_tokens_returned(a_idx)
                 if best_ret is not None and hasattr(a, "tokens_returned"):
                     a.tokens_returned = best_ret
+                if a_idx != -1:
+                    try:
+                        mcts_opp.reuse_after_play(a_idx)
+                    except Exception:
+                        mcts_opp.reset_root()
+                else:
+                    mcts_opp.reset_root()
+                mcts_me.reset_root()
             state = state.apply_action(a)
             move_count += 1
         my_pts = state.players[my_index].points
@@ -518,11 +962,15 @@ class Sample:
     state: np.ndarray  # flattened state (float32)
     pi: np.ndarray     # policy target over actions (float32, sum=1)
     player: int        # player to move at this state
+    action_idx: int    # base action index chosen (or -1 if unavailable)
+    ret_cands: Optional[np.ndarray] = None  # (K, 6) token-return candidates
+    ret_probs: Optional[np.ndarray] = None  # (K,) visit-based probs
 
 
 def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device: str = "cpu", temperature: float = 1.0,
                       temp_init: float = 1.0, temp_final: float = 0.0, temp_moves: int = 20,
-                      add_dirichlet: bool = True, mcts_batch: int = 16) -> Tuple[List[Sample], int]:
+                      add_dirichlet: bool = True, mcts_batch: int = 16,
+                      policy_log_moves: int = 0, policy_log_topk: int = 3) -> Tuple[List[Sample], int]:
     state = setup_game(num_players=2)
     mcts = AlphaZeroMCTS(model, device=device, n_simulations=mcts_simulations, mcts_batch=mcts_batch)
 
@@ -537,6 +985,8 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
         if not legal_actions:
             state.current_player = (state.current_player + 1) % len(state.players)
             consecutive_passes += 1
+            # Passing changes the player to move without an encoded action.
+            mcts.reset_root()
             # End if both players consecutively have no moves
             if consecutive_passes >= len(state.players):
                 ended_by_pass = True
@@ -546,9 +996,12 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
 
         # Temperature schedule across the game
         temp = temp_init if move_idx < temp_moves else temp_final
+        if int(policy_log_moves) > 0 and move_idx < int(policy_log_moves):
+            try:
+                log_policy_alignment(model, state, device=device, top_k=policy_log_topk)
+            except Exception:
+                pass
         pi, _ = mcts.run(state, temperature=temp, add_dirichlet=add_dirichlet)
-        s = flatten_game_state(state)
-        trajectory.append(Sample(state=s, pi=pi.astype(np.float32), player=state.current_player))
 
         # Sample an action: restrict to legal actions and renormalize
         legal_mask = legal_actions_mask(state)
@@ -566,17 +1019,30 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
                     a_idx_for_reuse = action_to_index(a, state)
                 except Exception:
                     a_idx_for_reuse = None
+                # Record sample (no return-targets if we didn't follow MCTS)
+                s = flatten_game_state(state)
+                trajectory.append(Sample(
+                    state=s,
+                    pi=pi.astype(np.float32),
+                    player=state.current_player,
+                    action_idx=int(a_idx_for_reuse) if a_idx_for_reuse is not None else -1,
+                    ret_cands=None,
+                    ret_probs=None,
+                ))
                 state = state.apply_action(a)
                 try:
                     if a_idx_for_reuse is not None:
                         mcts.reuse_after_play(a_idx_for_reuse)
+                    else:
+                        mcts.reset_root()
                 except Exception:
-                    pass
+                    mcts.reset_root()
                 move_idx += 1
                 continue
             else:
                 # Should not hit because we handled no-legal case earlier; skip turn defensively
                 state.current_player = (state.current_player + 1) % len(state.players)
+                mcts.reset_root()
                 move_idx += 1
                 continue
         else:
@@ -584,6 +1050,19 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
             a_idx = int(np.random.choice(len(probs), p=probs))
 
             action = index_to_action(a_idx, state)
+            # Return-targets from MCTS visit counts (if any)
+            ret = mcts.get_return_distribution(a_idx)
+            ret_cands, ret_probs = (ret if ret is not None else (None, None))
+            # Record sample before applying action
+            s = flatten_game_state(state)
+            trajectory.append(Sample(
+                state=s,
+                pi=pi.astype(np.float32),
+                player=state.current_player,
+                action_idx=int(a_idx),
+                ret_cands=ret_cands,
+                ret_probs=ret_probs,
+            ))
             # Use most-visited return variant for the chosen base action
             best_ret = mcts.get_best_tokens_returned(a_idx)
             if best_ret is not None and hasattr(action, "tokens_returned"):
@@ -613,15 +1092,68 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
     return trajectory, winner
 
 
-def compute_targets(trajectory: List[Sample], winner: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    X = torch.tensor(np.stack([t.state for t in trajectory]), dtype=torch.float32)
-    P = torch.tensor(np.stack([t.pi for t in trajectory]), dtype=torch.float32)
+def compute_targets(
+    trajectory: List[Sample],
+    winner: int,
+    color_augments: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], List[Optional[np.ndarray]], List[Optional[np.ndarray]]]:
+    """Build training targets, with optional color-permutation augmentation."""
+    X_np = np.stack([t.state for t in trajectory]).astype(np.float32)
+    P_np = np.stack([t.pi for t in trajectory]).astype(np.float32)
     if winner < 0:
-        Z = torch.zeros(len(trajectory), dtype=torch.float32)
+        Z_np = np.zeros(len(trajectory), dtype=np.float32)
     else:
         z = [1.0 if t.player == winner else -1.0 for t in trajectory]
-        Z = torch.tensor(z, dtype=torch.float32)
-    return X, P, Z
+        Z_np = np.array(z, dtype=np.float32)
+
+    ret_actions = [int(t.action_idx) for t in trajectory]
+    ret_cands = [t.ret_cands for t in trajectory]
+    ret_probs = [t.ret_probs for t in trajectory]
+
+    aug = max(0, int(color_augments))
+    if aug > 0 and len(trajectory) > 0:
+        xs = [X_np]
+        ps = [P_np]
+        zs = [Z_np]
+        ra_all = [ret_actions]
+        rc_all = [ret_cands]
+        rp_all = [ret_probs]
+        for _ in range(aug):
+            X_aug = np.empty_like(X_np)
+            P_aug = np.empty_like(P_np)
+            ra_aug: list[int] = []
+            rc_aug: list[Optional[np.ndarray]] = []
+            rp_aug: list[Optional[np.ndarray]] = []
+            for i in range(X_np.shape[0]):
+                perm = np.random.permutation(5)
+                X_aug[i] = permute_colors_in_flat_state(X_np[i], perm)
+                P_aug[i] = permute_policy_colors(P_np[i], perm)
+                # Action index under color permutation
+                ra_aug.append(permute_action_index(ret_actions[i], perm))
+                # Permute return candidates if present
+                if ret_cands[i] is not None:
+                    rc_aug.append(permute_token_vector(ret_cands[i], perm))
+                    rp_aug.append(ret_probs[i])
+                else:
+                    rc_aug.append(None)
+                    rp_aug.append(None)
+            xs.append(X_aug)
+            ps.append(P_aug)
+            zs.append(Z_np)
+            ra_all.append(ra_aug)
+            rc_all.append(rc_aug)
+            rp_all.append(rp_aug)
+        X_np = np.concatenate(xs, axis=0)
+        P_np = np.concatenate(ps, axis=0)
+        Z_np = np.concatenate(zs, axis=0)
+        ret_actions = [a for block in ra_all for a in block]
+        ret_cands = [c for block in rc_all for c in block]
+        ret_probs = [p for block in rp_all for p in block]
+
+    X = torch.tensor(X_np, dtype=torch.float32)
+    P = torch.tensor(P_np, dtype=torch.float32)
+    Z = torch.tensor(Z_np, dtype=torch.float32)
+    return X, P, Z, ret_actions, ret_cands, ret_probs
 
 
 # -----------------------------
@@ -650,8 +1182,9 @@ def _sp_init(model_bytes: bytes, input_size: int, action_size: int, width: int, 
     m = PolicyValueNet(input_size=input_size, action_size=action_size, width=width, n_blocks=res_blocks)
     buf = io.BytesIO(model_bytes)
     try:
-        state = torch.load(buf, map_location='cpu', weights_only=False)  # state_dict bytes
-    except Exception:
+        state = torch.load(buf, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
+    except TypeError:
+        # Older PyTorch without weights_only support.
         state = torch.load(buf, map_location='cpu')
     try:
         m.load_state_dict(state)
@@ -688,39 +1221,136 @@ def _sp_run(args: Tuple[int, float, float, float, int, bool, int, Optional[int]]
     )
 
 
-def train_on_batch(model: PolicyValueNet, optimizer: optim.Optimizer, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], device: Any = "cpu",
-                   policy_weight: float = 1.0, value_weight: float = 1.0, grad_clip: Optional[float] = None,
-                   scaler: Optional[Any] = None, entropy_coef: float = 0.0) -> Dict[str, float]:
-    X, P, Z = batch
+def train_on_batch(
+    model: PolicyValueNet,
+    optimizer: optim.Optimizer,
+    batch: Tuple[Any, ...],
+    device: Any = "cpu",
+    policy_weight: float = 1.0,
+    value_weight: float = 1.0,
+    return_weight: float = 0.5,
+    # Ablation: disable return-head loss without changing architecture
+    use_return_loss: bool = True,
+    grad_clip: Optional[float] = None,
+    scaler: Optional[Any] = None,
+    entropy_coef: float = 0.0,
+    max_policy_loss: Optional[float] = None,
+    max_total_loss: Optional[float] = None,
+) -> Dict[str, float]:
+    # Batch may include return-target info
+    if len(batch) >= 6:
+        X, P, Z, ret_actions, ret_cands, ret_probs = batch[:6]
+    else:
+        X, P, Z = batch  # type: ignore[misc]
+        ret_actions, ret_cands, ret_probs = [], [], []
     X, P, Z = X.to(device), P.to(device), Z.to(device)
     use_cuda = (isinstance(device, torch.device) and device.type == "cuda") or (isinstance(device, str) and str(device).startswith("cuda"))
     use_amp = scaler is not None and use_cuda
 
     optimizer.zero_grad(set_to_none=True)
 
+    def _is_divergent(policy_loss_t: torch.Tensor, total_loss_t: torch.Tensor) -> bool:
+        try:
+            pl = float(policy_loss_t.detach().item())
+            tl = float(total_loss_t.detach().item())
+        except Exception:
+            return True
+        if (not np.isfinite(pl)) or (not np.isfinite(tl)):
+            return True
+        if max_policy_loss is not None and pl > float(max_policy_loss):
+            return True
+        if max_total_loss is not None and tl > float(max_total_loss):
+            return True
+        return False
+
     if use_amp:
         # Prefer new torch.amp API, fallback to torch.cuda.amp
         try:
             autocast_ctx = torch.amp.autocast  # type: ignore[attr-defined]
             with autocast_ctx('cuda'):
-                logits, values = model(X)
+                logits, values, h = model(X, return_features=True)
                 log_probs = torch.log_softmax(logits, dim=-1)
                 policy_loss = -(P * log_probs).sum(dim=-1).mean()
                 # Entropy bonus (maximize entropy => subtract from loss)
                 probs = torch.softmax(logits, dim=-1)
                 entropy = (-(probs * torch.log_softmax(logits, dim=-1))).sum(dim=-1).mean()
                 value_loss = nn.functional.mse_loss(values, Z)
-                loss = policy_weight * policy_loss + value_weight * value_loss - float(entropy_coef) * entropy
+                # Return-choice loss (optional)
+                ret_loss = torch.zeros((), device=X.device, dtype=h.dtype)
+                ret_count = 0
+                if ret_cands:
+                    for i, cands in enumerate(ret_cands):
+                        if cands is None or ret_probs[i] is None:
+                            continue
+                        if len(cands) <= 1:
+                            continue
+                        cand_t = torch.tensor(cands, device=X.device, dtype=h.dtype)
+                        probs_t = torch.tensor(ret_probs[i], device=X.device, dtype=h.dtype)
+                        scores = model.score_return_candidates(h[i], ret_actions[i], cand_t)
+                        logp = torch.log_softmax(scores, dim=-1)
+                        ret_loss = ret_loss + (-(probs_t * logp).sum())
+                        ret_count += 1
+                if ret_count > 0:
+                    ret_loss = ret_loss / float(ret_count)
+                loss = (policy_weight * policy_loss +
+                        value_weight * value_loss +
+                        float(return_weight) * ret_loss -
+                        float(entropy_coef) * entropy)
+                if _is_divergent(policy_loss, loss):
+                    total_loss = (policy_weight * policy_loss +
+                                  value_weight * value_loss +
+                                  float(return_weight) * ret_loss)
+                    return {
+                        "loss": float(total_loss.item()),
+                        "policy_loss": float(policy_loss.item()),
+                        "value_loss": float(value_loss.item()),
+                        "return_loss": float(ret_loss.item()),
+                        "entropy": float(entropy.item()),
+                        "skipped": 1.0,
+                        "bad_batch": 1.0,
+                    }
         except Exception:
             # Backward compatibility
             with torch.cuda.amp.autocast():  # type: ignore[attr-defined]
-                logits, values = model(X)
+                logits, values, h = model(X, return_features=True)
                 log_probs = torch.log_softmax(logits, dim=-1)
                 policy_loss = -(P * log_probs).sum(dim=-1).mean()
                 probs = torch.softmax(logits, dim=-1)
                 entropy = (-(probs * torch.log_softmax(logits, dim=-1))).sum(dim=-1).mean()
                 value_loss = nn.functional.mse_loss(values, Z)
-                loss = policy_weight * policy_loss + value_weight * value_loss - float(entropy_coef) * entropy
+                ret_loss = torch.zeros((), device=X.device, dtype=h.dtype)
+                ret_count = 0
+                if ret_cands:
+                    for i, cands in enumerate(ret_cands):
+                        if cands is None or ret_probs[i] is None:
+                            continue
+                        if len(cands) <= 1:
+                            continue
+                        cand_t = torch.tensor(cands, device=X.device, dtype=h.dtype)
+                        probs_t = torch.tensor(ret_probs[i], device=X.device, dtype=h.dtype)
+                        scores = model.score_return_candidates(h[i], ret_actions[i], cand_t)
+                        logp = torch.log_softmax(scores, dim=-1)
+                        ret_loss = ret_loss + (-(probs_t * logp).sum())
+                        ret_count += 1
+                if ret_count > 0:
+                    ret_loss = ret_loss / float(ret_count)
+                loss = (policy_weight * policy_loss +
+                        value_weight * value_loss +
+                        float(return_weight) * ret_loss -
+                        float(entropy_coef) * entropy)
+                if _is_divergent(policy_loss, loss):
+                    total_loss = (policy_weight * policy_loss +
+                                  value_weight * value_loss +
+                                  float(return_weight) * ret_loss)
+                    return {
+                        "loss": float(total_loss.item()),
+                        "policy_loss": float(policy_loss.item()),
+                        "value_loss": float(value_loss.item()),
+                        "return_loss": float(ret_loss.item()),
+                        "entropy": float(entropy.item()),
+                        "skipped": 1.0,
+                        "bad_batch": 1.0,
+                    }
         scaler.scale(loss).backward()
         if grad_clip is not None and grad_clip > 0:
             scaler.unscale_(optimizer)
@@ -728,7 +1358,7 @@ def train_on_batch(model: PolicyValueNet, optimizer: optim.Optimizer, batch: Tup
         scaler.step(optimizer)
         scaler.update()
     else:
-        logits, values = model(X)
+        logits, values, h = model(X, return_features=True)
         # Policy loss: cross-entropy between target pi and predicted log-probs (masked by pi)
         log_probs = torch.log_softmax(logits, dim=-1)
         policy_loss = -(P * log_probs).sum(dim=-1).mean()
@@ -736,17 +1366,55 @@ def train_on_batch(model: PolicyValueNet, optimizer: optim.Optimizer, batch: Tup
         entropy = (-(probs * torch.log_softmax(logits, dim=-1))).sum(dim=-1).mean()
         # Value loss: MSE
         value_loss = nn.functional.mse_loss(values, Z)
-        loss = policy_weight * policy_loss + value_weight * value_loss - float(entropy_coef) * entropy
+        ret_loss = torch.zeros((), device=X.device, dtype=h.dtype)
+        ret_count = 0
+        if ret_cands:
+            for i, cands in enumerate(ret_cands):
+                if cands is None or ret_probs[i] is None:
+                    continue
+                if len(cands) <= 1:
+                    continue
+                cand_t = torch.tensor(cands, device=X.device, dtype=h.dtype)
+                probs_t = torch.tensor(ret_probs[i], device=X.device, dtype=h.dtype)
+                scores = model.score_return_candidates(h[i], ret_actions[i], cand_t)
+                logp = torch.log_softmax(scores, dim=-1)
+                ret_loss = ret_loss + (-(probs_t * logp).sum())
+                ret_count += 1
+        if ret_count > 0:
+            ret_loss = ret_loss / float(ret_count)
+        loss = (policy_weight * policy_loss +
+                value_weight * value_loss +
+                float(return_weight) * ret_loss -
+                float(entropy_coef) * entropy)
+        if _is_divergent(policy_loss, loss):
+            total_loss = (policy_weight * policy_loss +
+                          value_weight * value_loss +
+                          float(return_weight) * ret_loss)
+            return {
+                "loss": float(total_loss.item()),
+                "policy_loss": float(policy_loss.item()),
+                "value_loss": float(value_loss.item()),
+                "return_loss": float(ret_loss.item()) if "ret_loss" in locals() else 0.0,
+                "entropy": float(entropy.item()),
+                "skipped": 1.0,
+                "bad_batch": 1.0,
+            }
         loss.backward()
         if grad_clip is not None and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
+    total_loss = (policy_weight * policy_loss +
+                  value_weight * value_loss +
+                  float(return_weight) * ret_loss)
     return {
-        "loss": float((policy_weight * policy_loss + value_weight * value_loss).item()),
+        "loss": float(total_loss.item()),
         "policy_loss": float(policy_loss.item()),
         "value_loss": float(value_loss.item()),
+        "return_loss": float(ret_loss.item()) if "ret_loss" in locals() else 0.0,
         "entropy": float(entropy.item()),
+        "skipped": 0.0,
+        "bad_batch": 0.0,
     }
 
 
@@ -756,28 +1424,55 @@ class ReplayBuffer:
         self.states: List[np.ndarray] = []
         self.pis: List[np.ndarray] = []
         self.zs: List[float] = []
+        self.ret_actions: List[int] = []
+        self.ret_cands: List[Optional[np.ndarray]] = []
+        self.ret_probs: List[Optional[np.ndarray]] = []
 
-    def add(self, X: torch.Tensor, P: torch.Tensor, Z: torch.Tensor):
+    def add(
+        self,
+        X: torch.Tensor,
+        P: torch.Tensor,
+        Z: torch.Tensor,
+        ret_actions: Optional[List[int]] = None,
+        ret_cands: Optional[List[Optional[np.ndarray]]] = None,
+        ret_probs: Optional[List[Optional[np.ndarray]]] = None,
+    ):
+        n = X.size(0)
+        if ret_actions is None:
+            ret_actions = [-1] * n
+        if ret_cands is None:
+            ret_cands = [None] * n
+        if ret_probs is None:
+            ret_probs = [None] * n
         for i in range(X.size(0)):
             if len(self.states) >= self.capacity:
                 # FIFO eviction
                 self.states.pop(0)
                 self.pis.pop(0)
                 self.zs.pop(0)
+                self.ret_actions.pop(0)
+                self.ret_cands.pop(0)
+                self.ret_probs.pop(0)
             self.states.append(X[i].cpu().numpy())
             self.pis.append(P[i].cpu().numpy())
             self.zs.append(float(Z[i].cpu().item()))
+            self.ret_actions.append(int(ret_actions[i]))
+            self.ret_cands.append(ret_cands[i])
+            self.ret_probs.append(ret_probs[i])
 
     def size(self) -> int:
         return len(self.states)
 
-    def sample(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def sample(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], List[Optional[np.ndarray]], List[Optional[np.ndarray]]]:
         n = min(batch_size, len(self.states))
         idxs = np.random.choice(len(self.states), size=n, replace=False)
         X = torch.tensor(np.stack([self.states[i] for i in idxs]), dtype=torch.float32)
         P = torch.tensor(np.stack([self.pis[i] for i in idxs]), dtype=torch.float32)
         Z = torch.tensor([self.zs[i] for i in idxs], dtype=torch.float32)
-        return X, P, Z
+        ret_actions = [self.ret_actions[i] for i in idxs]
+        ret_cands = [self.ret_cands[i] for i in idxs]
+        ret_probs = [self.ret_probs[i] for i in idxs]
+        return X, P, Z, ret_actions, ret_cands, ret_probs
 
 
 def _find_latest_checkpoint(ckpt_dir: str) -> Optional[Tuple[str, int]]:
@@ -800,6 +1495,58 @@ def _find_latest_checkpoint(ckpt_dir: str) -> Optional[Tuple[str, int]]:
     return (best_path, best_iter) if best_path is not None else None
 
 
+def _find_latest_model_checkpoint(ckpt_dir: str) -> Optional[Tuple[str, int]]:
+    try:
+        files = os.listdir(ckpt_dir)
+    except FileNotFoundError:
+        return None
+    best_path = None
+    best_iter = -1
+    suffix = "_model.pt"
+    for fname in files:
+        if fname.startswith("az_iter_") and fname.endswith(suffix):
+            num_str = fname[len("az_iter_"):-len(suffix)]
+            try:
+                it = int(num_str)
+            except Exception:
+                continue
+            if it > best_iter:
+                best_iter = it
+                best_path = os.path.join(ckpt_dir, fname)
+    return (best_path, best_iter) if best_path is not None else None
+
+
+def _load_elo_pool(path: str) -> List[Dict[str, Any]]:
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            # Migrate older full-checkpoint paths to model-only paths when available.
+            migrated: List[Dict[str, Any]] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                ent = dict(item)
+                p = ent.get("path")
+                if isinstance(p, str) and p.endswith(".pt") and not p.endswith("_model.pt"):
+                    cand = p[:-3] + "_model.pt"
+                    if os.path.exists(cand):
+                        ent["path"] = cand
+                migrated.append(ent)
+            return migrated
+    except Exception:
+        pass
+    return []
+
+
+def _save_elo_pool(path: str, pool: List[Dict[str, Any]]) -> None:
+    try:
+        with open(path, "w") as f:
+            json.dump(pool, f, indent=2)
+    except Exception:
+        pass
+
+
 def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: int = 32, device: str = "cpu", mcts_batch: int = 16, max_moves: int = 250) -> float:
     wins = 0
     for g in range(games):
@@ -815,6 +1562,7 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
             if not legal:
                 state.current_player = (state.current_player + 1) % len(state.players)
                 consecutive_passes += 1
+                mcts.reset_root()
                 # Break stalemates where neither player has legal moves
                 if consecutive_passes >= len(state.players):
                     ended_by_pass = True
@@ -846,7 +1594,10 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
                 try:
                     mcts.reuse_after_play(played_a_idx)
                 except Exception:
-                    pass
+                    mcts.reset_root()
+            else:
+                # Opponent/random move or unencodable action -> tree is stale.
+                mcts.reset_root()
         winner_idx = state.winner
         if winner_idx is None and ended_by_pass:
             # Provisional winner on pass-break only
@@ -941,24 +1692,35 @@ def evaluate_vs_greedy(model: PolicyValueNet, games: int = 50, mcts_simulations:
             if not legal:
                 state.current_player = (state.current_player + 1) % len(state.players)
                 consecutive_passes += 1
+                mcts.reset_root()
                 if consecutive_passes >= len(state.players):
                     ended_by_pass = True
                     break
                 continue
+            played_a_idx: Optional[int] = None
             if state.current_player == my_index:
                 _, a_idx = mcts.run(state, temperature=0.0)
                 if a_idx == -1:
                     a = legal[0]
+                    played_a_idx = None
                 else:
                     a = index_to_action(a_idx, state)
                     best_ret = mcts.get_best_tokens_returned(a_idx)
                     if best_ret is not None and hasattr(a, "tokens_returned"):
                         a.tokens_returned = best_ret
+                    played_a_idx = a_idx
             else:
                 a = _greedy_action(state)
             state = state.apply_action(a)
             move_count += 1
             consecutive_passes = 0
+            if played_a_idx is not None:
+                try:
+                    mcts.reuse_after_play(played_a_idx)
+                except Exception:
+                    mcts.reset_root()
+            else:
+                mcts.reset_root()
         lengths.append(move_count)
         my_pts = state.players[my_index].points
         opp_pts = state.players[1 - my_index].points
@@ -1001,10 +1763,15 @@ def az_train(
     ckpt_dir: str = "checkpoints",
     resume: bool = True,
     resume_path: Optional[str] = None,
+    # If False, resume model/iter only and reset optimizer state.
+    resume_optimizer_state: bool = True,
     weight_decay: float = 1e-4,
     grad_clip: float = 1.0,
     policy_weight: float = 1.0,
     value_weight: float = 1.0,
+    return_weight: float = 0.5,
+    # Ablation: disable return-head loss without changing architecture
+    use_return_loss: bool = True,
     # Value warmup (optional): if >0, use value_warmup_weight for first N global iterations
     value_warmup_iters: int = 0,
     value_warmup_weight: float = 1.5,
@@ -1015,12 +1782,32 @@ def az_train(
     gate_pool: bool = False,
     gate_games: int = 200,
     gate_threshold: float = 0.57,
+    # Delay champion gating for the first N global iterations.
+    gate_start_iter: int = 1,
+    # If True, rejected challengers are replaced by champion weights for next iteration.
+    gate_revert_on_reject: bool = False,
+    # Elo ladder (training signal strength)
+    use_elo_ladder: bool = False,
+    ladder_pool_size: int = 4,
+    ladder_opponents: int = 2,
+    ladder_games: int = 16,
+    ladder_sims: int = 48,
+    ladder_k: float = 16.0,
+    ladder_promote_threshold: float = 0.52,
+    ladder_base_elo: float = 1000.0,
     # LR + entropy knobs
     use_cosine_lr: bool = True,
-    lr_min: float = 1e-4,
+    lr_min: float = 1e-6,
     warmup_iters: int = 2,
     entropy_init: float = 0.01,
     entropy_anneal_iters: int = 8,
+    # Anti-divergence guards for unstable backends/runs.
+    divergence_policy_loss: float = 50.0,
+    divergence_total_loss: float = 200.0,
+    divergence_lr_backoff: float = 0.5,
+    divergence_min_lr: float = 1e-6,
+    divergence_max_skips_per_iter: int = 3,
+    divergence_rollback: bool = True,
     # Model architecture
     width: int = 512,
     res_blocks: int = 6,
@@ -1029,6 +1816,11 @@ def az_train(
     # Periodic big evaluation
     big_eval_every: int = 5,
     big_eval_games: int = 200,
+    # Data augmentation: number of random color permutations per game
+    color_augments: int = 1,
+    # Debug: log per-card policy logits for the first N moves of a game (0 disables)
+    policy_log_moves: int = 0,
+    policy_log_topk: int = 3,
     # Parallel self-play
     selfplay_workers: int = 0,
     selfplay_device: Optional[str] = None,
@@ -1036,8 +1828,60 @@ def az_train(
     # Setup
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
+    expected_train_header = "iter,buffer,avg_steps,loss,policy_loss,value_loss,return_loss,win_rand,win_greedy,margin_g,len_g"
     log_path = os.path.join(log_dir, "train_log.csv")
     write_header = not os.path.exists(log_path)
+    # Keep a single canonical log file by migrating legacy schemas in place.
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", newline="") as rf:
+                first = (rf.readline() or "").strip()
+            if first and first != expected_train_header:
+                legacy_fields = [c.strip() for c in first.split(",")]
+                # Create a non-destructive backup before migration.
+                backup_base = os.path.join(log_dir, "train_log_legacy")
+                backup_path = backup_base + ".csv"
+                bi = 2
+                while os.path.exists(backup_path):
+                    backup_path = f"{backup_base}_{bi}.csv"
+                    bi += 1
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(log_path, backup_path)
+                except Exception:
+                    backup_path = ""
+
+                tmp_path = log_path + ".tmp"
+                new_cols = expected_train_header.split(",")
+                with open(log_path, "r", newline="") as src, open(tmp_path, "w", newline="") as dst:
+                    r = csv.reader(src)
+                    w = csv.writer(dst)
+                    _ = next(r, None)  # consume old header
+                    w.writerow(new_cols)
+                    old_idx = {name: i for i, name in enumerate(legacy_fields)}
+                    for row in r:
+                        rec = {k: (row[v] if v < len(row) else "") for k, v in old_idx.items()}
+                        mapped: list[str] = []
+                        for c in new_cols:
+                            if c in rec:
+                                mapped.append(rec[c])
+                            elif c == "win_rand" and "win_rate" in rec:
+                                mapped.append(rec["win_rate"])
+                            else:
+                                mapped.append("")
+                        w.writerow(mapped)
+                os.replace(tmp_path, log_path)
+                write_header = False
+                if backup_path:
+                    print(f"[Log] Migrated train_log.csv to current schema (backup: {backup_path})")
+                else:
+                    print("[Log] Migrated train_log.csv to current schema")
+        except Exception:
+            # Fallback behavior if migration fails for any reason.
+            alt = os.path.join(log_dir, "train_log_v2.csv")
+            print(f"[Log] Existing train_log schema mismatch; writing to {alt}")
+            log_path = alt
+            write_header = not os.path.exists(log_path)
     big_eval_path = os.path.join(log_dir, "eval_big.csv")
     big_write_header = not os.path.exists(big_eval_path)
 
@@ -1085,8 +1929,17 @@ def az_train(
     scheduler: Optional[CosineAnnealingLR] = None
     if use_cosine_lr:
         try:
+            # Guardrail: eta_min must stay below base lr, otherwise cosine schedule
+            # ramps LR up (destabilizing low-LR recovery runs).
+            eff_lr_min = float(lr_min)
+            if eff_lr_min >= float(lr):
+                eff_lr_min = max(1e-8, float(lr) * 0.1)
+                print(
+                    f"[LR] Adjusted lr_min from {float(lr_min):.2e} to {eff_lr_min:.2e} "
+                    f"because lr={float(lr):.2e}"
+                )
             tmax = max(1, iterations - max(0, int(warmup_iters)))
-            scheduler = CosineAnnealingLR(optimizer, T_max=tmax, eta_min=lr_min)
+            scheduler = CosineAnnealingLR(optimizer, T_max=tmax, eta_min=eff_lr_min)
         except Exception:
             scheduler = None
     # Enable TF32 on CUDA (Ampere+)
@@ -1117,33 +1970,30 @@ def az_train(
     def _load_checkpoint_cpu_safe(path: str):
         """Load a checkpoint safely on CPU with best-effort fallbacks.
         Tries weights_only=True first (PyTorch 2.4+ safe loader). If that fails due to
-        missing allowlisted globals, attempts to add them. Falls back to a normal
-        torch.load(map_location='cpu') as last resort (only use with trusted files).
+        missing allowlisted globals, attempts to add them and retries.
         """
         import torch as _torch
-        # First attempt: safe weights-only if available
+        # First attempt: safe weights-only.
         try:
-            try:
-                return _torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
-            except TypeError:
-                # Older PyTorch without weights_only
-                return _torch.load(path, map_location='cpu')
+            return _torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
         except Exception:
-            # Try to allowlist needed globals for safe loader, then retry
-            try:
-                try:
-                    from torch.serialization import add_safe_globals  # type: ignore
-                    try:
-                        from torch._utils import _rebuild_device_tensor_from_numpy  # type: ignore
-                        add_safe_globals([_rebuild_device_tensor_from_numpy])  # type: ignore
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                return _torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
-            except Exception:
-                # Final fallback: unsafe loader on CPU (only acceptable for own checkpoints)
-                return _torch.load(path, map_location='cpu')
+            # Try to allowlist needed globals for safe loader, then retry.
+            _allowlist_checkpoint_globals()
+            return _torch.load(path, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
+
+    def _resume_from_model_only(path: str, iter_hint: int = 0) -> bool:
+        nonlocal start_iter_global
+        try:
+            ck = _load_checkpoint_cpu_safe(path)
+            sd = ck.get("model", ck)
+            model.load_state_dict(sd)
+            start_iter_global = int(ck.get("iter", iter_hint))
+            print(f"[Resume] Loaded model-only checkpoint {path} @ iter {start_iter_global} (optimizer reset)")
+            return True
+        except Exception as e:
+            print(f"[Resume] Failed to load model-only checkpoint {path}: {e}")
+            return False
+
     if resume or resume_path:
         loaded = False
         if resume_path is not None and os.path.exists(resume_path):
@@ -1151,28 +2001,7 @@ def az_train(
                 # Load safely on CPU, then move to target device
                 ck = _load_checkpoint_cpu_safe(resume_path)
                 model.load_state_dict(ck["model"])
-                optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
-                _configure_optimizer_for_device(optimizer, device)
-                # Move optimizer state tensors to target device
-                try:
-                    for state in optimizer.state.values():  # type: ignore[attr-defined]
-                        for k, v in list(state.items()):
-                            if isinstance(v, torch.Tensor):
-                                state[k] = v.to(device)
-                except Exception:
-                    pass
-                start_iter_global = int(ck.get("iter", 0))
-                print(f"[Resume] Loaded checkpoint {resume_path} @ iter {start_iter_global}")
-                loaded = True
-            except Exception as e:
-                print(f"[Resume] Failed to load {resume_path}: {e}")
-        if not loaded and resume and os.path.isdir(ckpt_dir):
-            latest = _find_latest_checkpoint(ckpt_dir)
-            if latest is not None:
-                path, itnum = latest
-                try:
-                    ck = _load_checkpoint_cpu_safe(path)
-                    model.load_state_dict(ck["model"])
+                if resume_optimizer_state and ("optimizer" in ck):
                     optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
                     _configure_optimizer_for_device(optimizer, device)
                     # Move optimizer state tensors to target device
@@ -1183,10 +2012,60 @@ def az_train(
                                     state[k] = v.to(device)
                     except Exception:
                         pass
+                else:
+                    try:
+                        optimizer.state.clear()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                start_iter_global = int(ck.get("iter", 0))
+                if resume_optimizer_state and ("optimizer" in ck):
+                    print(f"[Resume] Loaded checkpoint {resume_path} @ iter {start_iter_global} (optimizer restored)")
+                else:
+                    print(f"[Resume] Loaded checkpoint {resume_path} @ iter {start_iter_global} (optimizer reset)")
+                loaded = True
+            except Exception as e:
+                print(f"[Resume] Full checkpoint load failed for {resume_path}: {e}")
+                # Fallback to model-only path when available.
+                if isinstance(resume_path, str) and resume_path.endswith(".pt") and not resume_path.endswith("_model.pt"):
+                    model_path = resume_path[:-3] + "_model.pt"
+                    if os.path.exists(model_path):
+                        loaded = _resume_from_model_only(model_path)
+        if not loaded and resume and os.path.isdir(ckpt_dir):
+            latest = _find_latest_checkpoint(ckpt_dir)
+            if latest is not None:
+                path, itnum = latest
+                try:
+                    ck = _load_checkpoint_cpu_safe(path)
+                    model.load_state_dict(ck["model"])
+                    if resume_optimizer_state and ("optimizer" in ck):
+                        optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
+                        _configure_optimizer_for_device(optimizer, device)
+                        # Move optimizer state tensors to target device
+                        try:
+                            for state in optimizer.state.values():  # type: ignore[attr-defined]
+                                for k, v in list(state.items()):
+                                    if isinstance(v, torch.Tensor):
+                                        state[k] = v.to(device)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            optimizer.state.clear()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
                     start_iter_global = int(ck.get("iter", itnum))
-                    print(f"[Resume] Loaded latest checkpoint {path} @ iter {start_iter_global}")
+                    if resume_optimizer_state and ("optimizer" in ck):
+                        print(f"[Resume] Loaded latest checkpoint {path} @ iter {start_iter_global} (optimizer restored)")
+                    else:
+                        print(f"[Resume] Loaded latest checkpoint {path} @ iter {start_iter_global} (optimizer reset)")
+                    loaded = True
                 except Exception as e:
-                    print(f"[Resume] Failed to load {path}: {e}")
+                    print(f"[Resume] Latest full checkpoint not loadable ({path}): {e}")
+            if not loaded:
+                latest_model = _find_latest_model_checkpoint(ckpt_dir)
+                if latest_model is not None:
+                    model_path, itnum = latest_model
+                    loaded = _resume_from_model_only(model_path, iter_hint=itnum)
 
     # Auto-tune mcts_batch by device (CUDA:64, else:32)
     try:
@@ -1245,13 +2124,14 @@ def az_train(
                         for i in range(games_per_iter)
                     ]
                     for idx, (traj, winner) in enumerate(pool.imap_unordered(_sp_run, args_list), start=1):
-                        X, P, Z = compute_targets(traj, winner)
-                        buffer.add(X, P, Z)
+                        X, P, Z, ret_actions, ret_cands, ret_probs = compute_targets(traj, winner, color_augments=color_augments)
+                        buffer.add(X, P, Z, ret_actions, ret_cands, ret_probs)
                         step_counts.append(len(traj))
                         print(f"[Iter {it}] Self-play {idx}/{games_per_iter} steps={len(traj)}")
             else:
                 # Fallback to sequential if workers <=1 or serialization failed
                 for g in range(games_per_iter):
+                    log_moves = int(policy_log_moves) if (g == 0 and step == 1) else 0
                     traj, winner = self_play_episode(
                         model,
                         mcts_simulations=mcts_simulations,
@@ -1262,14 +2142,17 @@ def az_train(
                         temp_moves=temp_moves,
                         add_dirichlet=True,
                         mcts_batch=mcts_batch,
+                        policy_log_moves=log_moves,
+                        policy_log_topk=policy_log_topk,
                     )
-                    X, P, Z = compute_targets(traj, winner)
-                    buffer.add(X, P, Z)
+                    X, P, Z, ret_actions, ret_cands, ret_probs = compute_targets(traj, winner, color_augments=color_augments)
+                    buffer.add(X, P, Z, ret_actions, ret_cands, ret_probs)
                     step_counts.append(len(traj))
                     print(f"[Iter {it}] Self-play {g+1}/{games_per_iter} steps={len(traj)}")
         else:
             # Sequential self-play
             for g in range(games_per_iter):
+                log_moves = int(policy_log_moves) if (g == 0 and step == 1) else 0
                 traj, winner = self_play_episode(
                     model,
                     mcts_simulations=mcts_simulations,
@@ -1280,9 +2163,11 @@ def az_train(
                     temp_moves=temp_moves,
                     add_dirichlet=True,
                     mcts_batch=mcts_batch,
+                    policy_log_moves=log_moves,
+                    policy_log_topk=policy_log_topk,
                 )
-                X, P, Z = compute_targets(traj, winner)
-                buffer.add(X, P, Z)
+                X, P, Z, ret_actions, ret_cands, ret_probs = compute_targets(traj, winner, color_augments=color_augments)
+                buffer.add(X, P, Z, ret_actions, ret_cands, ret_probs)
                 step_counts.append(len(traj))
                 print(f"[Iter {it}] Self-play {g+1}/{games_per_iter} steps={len(traj)}")
 
@@ -1290,6 +2175,14 @@ def az_train(
         losses = []
         pol_losses = []
         val_losses = []
+        ret_losses = []
+        skipped_batches = 0
+        # Rollback snapshot in case repeated divergence is detected within this iteration.
+        pre_train_model_sd = _model_state_dict_cpu(model)
+        try:
+            pre_train_opt_sd = copy.deepcopy(optimizer.state_dict())
+        except Exception:
+            pre_train_opt_sd = None
         print(f"[Iter {it}] Train: {train_batches_per_iter} batches (buffer={buffer.size()})")
         # Entropy coefficient (linear anneal)
         ent_coef = 0.0
@@ -1302,12 +2195,6 @@ def az_train(
             if step <= max(0, int(warmup_iters)):
                 for pg in optimizer.param_groups:
                     pg["lr"] = float(lr) * float(step) / float(max(1, int(warmup_iters)))
-            else:
-                # Step cosine scheduler per-iteration after warmup
-                try:
-                    scheduler.step()
-                except Exception:
-                    pass
         # Determine effective value weight (warmup for early global iterations)
         eff_value_weight = value_weight
         try:
@@ -1327,13 +2214,63 @@ def az_train(
                 device=device,
                 policy_weight=policy_weight,
                 value_weight=eff_value_weight,
+                return_weight=return_weight if use_return_loss else 0.0,
                 grad_clip=grad_clip,
                 scaler=scaler,
                 entropy_coef=ent_coef,
+                max_policy_loss=divergence_policy_loss,
+                max_total_loss=divergence_total_loss,
             )
+            if float(stats.get("skipped", 0.0)) > 0.5:
+                skipped_batches += 1
+                # Back off LR when a divergent batch is detected.
+                old_lr = None
+                new_lr = None
+                try:
+                    for pg in optimizer.param_groups:
+                        cur = float(pg.get("lr", lr))
+                        old_lr = cur if old_lr is None else old_lr
+                        nxt = max(float(divergence_min_lr), cur * float(divergence_lr_backoff))
+                        pg["lr"] = nxt
+                        new_lr = nxt
+                except Exception:
+                    pass
+                print(
+                    f"[Guard] Skipped divergent batch {bi+1}/{train_batches_per_iter} "
+                    f"(policy={stats.get('policy_loss', float('nan')):.4f}, "
+                    f"loss={stats.get('loss', float('nan')):.4f}); "
+                    f"lr {old_lr if old_lr is not None else float('nan'):.2e} -> "
+                    f"{new_lr if new_lr is not None else float('nan'):.2e}"
+                )
+                if skipped_batches >= int(divergence_max_skips_per_iter):
+                    print(f"[Guard] Reached {skipped_batches} skipped batches in iter {it}")
+                    if divergence_rollback:
+                        try:
+                            model.load_state_dict(pre_train_model_sd)
+                            if pre_train_opt_sd is not None:
+                                optimizer.load_state_dict(pre_train_opt_sd)  # type: ignore[arg-type]
+                                _configure_optimizer_for_device(optimizer, device)
+                                try:
+                                    for state in optimizer.state.values():  # type: ignore[attr-defined]
+                                        for k, v in list(state.items()):
+                                            if isinstance(v, torch.Tensor):
+                                                state[k] = v.to(device)
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    optimizer.state.clear()  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
+                            print(f"[Guard] Rolled back to pre-train snapshot for iter {it}")
+                        except Exception as e:
+                            print(f"[Guard] Rollback failed at iter {it}: {e}")
+                    break
+                continue
             losses.append(stats["loss"])
             pol_losses.append(stats["policy_loss"])
             val_losses.append(stats["value_loss"])
+            ret_losses.append(stats.get("return_loss", 0.0))
             interval = max(1, train_batches_per_iter // 5)
             if ((bi + 1) % interval == 0) or (bi + 1 == train_batches_per_iter):
                 # Also report LR and entropy coef occasionally
@@ -1343,9 +2280,18 @@ def az_train(
                     cur_lr = lr
                 print(f"[Iter {it}] Train {bi+1}/{train_batches_per_iter} loss={stats['loss']:.4f} lr={cur_lr:.2e} ent={ent_coef:.4f}")
 
-        avg_loss = float(np.mean(losses)) if losses else float("nan")
-        avg_pl = float(np.mean(pol_losses)) if pol_losses else float("nan")
-        avg_vl = float(np.mean(val_losses)) if val_losses else float("nan")
+        if losses:
+            avg_loss = float(np.mean(losses))
+            avg_pl = float(np.mean(pol_losses))
+            avg_vl = float(np.mean(val_losses))
+            avg_rl = float(np.mean(ret_losses))
+        else:
+            avg_loss = 0.0
+            avg_pl = 0.0
+            avg_vl = 0.0
+            avg_rl = 0.0
+            if skipped_batches > 0:
+                print(f"[Guard] No optimizer steps applied in iter {it} (all guarded/skipped)")
         avg_steps = float(np.mean(step_counts)) if step_counts else 0.0
 
         # Evaluate vs random (and greedy for extra signal)
@@ -1366,22 +2312,90 @@ def az_train(
             mcts_batch=mcts_batch,
         )
 
-        # Save checkpoint
+        # Save checkpoint (full + model-only for safe arena/ladder loading)
         ckpt_path = os.path.join(ckpt_dir, f"az_iter_{it}.pt")
+        ckpt_model_path = os.path.join(ckpt_dir, f"az_iter_{it}_model.pt")
+        model_sd_cpu = _model_state_dict_cpu(model)
         torch.save({
-            "model": model.state_dict(),
+            "model": model_sd_cpu,
             "optimizer": optimizer.state_dict(),
             "iter": it,
             "buffer_size": buffer.size(),
         }, ckpt_path)
+        torch.save({
+            "model": model_sd_cpu,
+            "iter": it,
+        }, ckpt_model_path)
+
+        # Elo ladder evaluation (optional)
+        if use_elo_ladder:
+            try:
+                elo_path = os.path.join(log_dir, "elo_pool.json")
+                elo_log = os.path.join(log_dir, "elo_log.csv")
+                pool = _load_elo_pool(elo_path)
+                # Index by path for quick lookup
+                pool_by_path = {p.get("path"): p for p in pool if isinstance(p, dict)}
+                cand_entry = pool_by_path.get(ckpt_model_path, {"path": ckpt_model_path, "elo": float(ladder_base_elo), "iter": it})
+                cand_elo = float(cand_entry.get("elo", ladder_base_elo))
+                # If empty pool, seed it and skip eval
+                if not pool:
+                    pool.append(cand_entry)
+                    _save_elo_pool(elo_path, pool)
+                    print(f"[Elo] Initialized pool with {ckpt_model_path}")
+                else:
+                    # Select opponents
+                    opp_pool = [p for p in pool if p.get("path") != ckpt_model_path]
+                    if opp_pool:
+                        k = min(int(ladder_opponents), len(opp_pool))
+                        opponents = random.sample(opp_pool, k=k)
+                        avg_wr = 0.0
+                        # Prepare CSV log
+                        newfile = not os.path.exists(elo_log)
+                        with open(elo_log, "a", newline="") as ef:
+                            w = csv.writer(ef)
+                            if newfile:
+                                w.writerow(["iter", "cand_path", "opp_path", "games", "win_rate", "cand_elo_before", "opp_elo_before", "cand_elo_after", "opp_elo_after"])
+                            for opp in opponents:
+                                opp_path = opp.get("path")
+                                opp_elo = float(opp.get("elo", ladder_base_elo))
+                                opp_model = _load_ckpt_model(opp_path, device, input_size, action_size, width=width, res_blocks=res_blocks)
+                                if opp_model is None:
+                                    continue
+                                wr, _margin = arena_vs_model(model, opp_model, games=int(ladder_games), sims=int(ladder_sims), device=device, mcts_batch=mcts_batch)
+                                expected = 1.0 / (1.0 + 10 ** ((opp_elo - cand_elo) / 400.0))
+                                cand_elo_before = cand_elo
+                                opp_elo_before = opp_elo
+                                cand_elo = cand_elo + float(ladder_k) * (wr - expected)
+                                opp_elo = opp_elo + float(ladder_k) * ((1.0 - wr) - (1.0 - expected))
+                                opp["elo"] = float(opp_elo)
+                                avg_wr += float(wr)
+                                w.writerow([it, ckpt_model_path, opp_path, int(ladder_games), f"{wr:.4f}", f"{cand_elo_before:.2f}", f"{opp_elo_before:.2f}", f"{cand_elo:.2f}", f"{opp_elo:.2f}"])
+                        avg_wr = avg_wr / max(1, len(opponents))
+                        # Promote into pool if strong enough (or update existing)
+                        cand_entry["elo"] = float(cand_elo)
+                        cand_entry["iter"] = int(it)
+                        if ckpt_model_path in pool_by_path:
+                            pool_by_path[ckpt_model_path].update(cand_entry)
+                        elif avg_wr >= float(ladder_promote_threshold):
+                            pool.append(cand_entry)
+                            print(f"[Elo] Promoted to pool (avg win={avg_wr:.2%}, elo={cand_elo:.1f})")
+                        else:
+                            print(f"[Elo] Not promoted (avg win={avg_wr:.2%}, elo={cand_elo:.1f})")
+                        # Enforce pool size
+                        pool = sorted(pool, key=lambda p: float(p.get("elo", ladder_base_elo)), reverse=True)
+                        if len(pool) > int(ladder_pool_size):
+                            pool = pool[: int(ladder_pool_size)]
+                        _save_elo_pool(elo_path, pool)
+            except Exception as e:
+                print(f"[Elo] ladder failed: {e}")
 
         # Optional: gate vs champion pool
-        if gate_pool:
+        if gate_pool and int(it) >= int(gate_start_iter):
             try:
                 champ_path = os.path.join(ckpt_dir, "champion.pt")
                 # If no champion yet, set current as champion
                 if not os.path.exists(champ_path):
-                    torch.save({"model": model.state_dict(), "iter": it}, champ_path)
+                    torch.save({"model": _model_state_dict_cpu(model), "iter": it}, champ_path)
                     print(f"[Gate] Set initial champion at iter {it}")
                 else:
                     dummy_state = setup_game(num_players=2)
@@ -1404,22 +2418,36 @@ def az_train(
                         except Exception:
                             pass
                         if wr >= gate_threshold:
-                            torch.save({"model": model.state_dict(), "iter": it}, champ_path)
+                            torch.save({"model": _model_state_dict_cpu(model), "iter": it}, champ_path)
                             print(f"[Gate] Promoted iter {it} to champion (>= {gate_threshold:.0%})")
+                        elif gate_revert_on_reject:
+                            try:
+                                champ_ck = _load_checkpoint_cpu_safe(champ_path)
+                                model.load_state_dict(champ_ck.get("model", champ_ck))
+                                # Reset optimizer state after hard revert to avoid stale momentum.
+                                try:
+                                    optimizer.state.clear()  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
+                                print(f"[Gate] Rejected iter {it}; reverted to champion weights")
+                            except Exception as ge:
+                                print(f"[Gate] Failed reverting to champion: {ge}")
             except Exception as e:
                 print(f"[Gate] gating failed: {e}")
+        elif gate_pool and int(it) < int(gate_start_iter):
+            print(f"[Gate] Warmup skip at iter {it} (gate starts at iter {int(gate_start_iter)})")
 
         # Log CSV
         with open(log_path, "a", newline="") as f:
             writer = csv.writer(f)
             if write_header:
-                writer.writerow(["iter", "buffer", "avg_steps", "loss", "policy_loss", "value_loss", "win_rand", "win_greedy", "margin_g", "len_g"])
+                writer.writerow(["iter", "buffer", "avg_steps", "loss", "policy_loss", "value_loss", "return_loss", "win_rand", "win_greedy", "margin_g", "len_g"])
                 write_header = False
-            writer.writerow([it, buffer.size(), f"{avg_steps:.2f}", f"{avg_loss:.4f}", f"{avg_pl:.4f}", f"{avg_vl:.4f}", f"{win_rate:.3f}", f"{win_g:.3f}", f"{margin_g:.3f}", f"{len_g:.2f}"])
+            writer.writerow([it, buffer.size(), f"{avg_steps:.2f}", f"{avg_loss:.4f}", f"{avg_pl:.4f}", f"{avg_vl:.4f}", f"{avg_rl:.4f}", f"{win_rate:.3f}", f"{win_g:.3f}", f"{margin_g:.3f}", f"{len_g:.2f}"])
 
         print(
             f"Iter {it:02d} | buffer={buffer.size()} steps={avg_steps:.1f} "
-            f"loss={avg_loss:.4f} pol={avg_pl:.4f} val={avg_vl:.4f} "
+            f"loss={avg_loss:.4f} pol={avg_pl:.4f} val={avg_vl:.4f} ret={avg_rl:.4f} "
             f"win%_rand={win_rate:.1%} win%_greedy={win_g:.1%} margin_g={margin_g:.2f} len_g={len_g:.1f}"
         )
 
@@ -1476,6 +2504,13 @@ def az_train(
                     pass
         except Exception as e:
             print(f"[BigEval] failed: {e}")
+
+        # Step cosine scheduler after optimizer steps (avoids PyTorch order warning).
+        if scheduler is not None and step > max(0, int(warmup_iters)) and len(losses) > 0:
+            try:
+                scheduler.step()
+            except Exception:
+                pass
 
     return model
 

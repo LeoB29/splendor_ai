@@ -15,6 +15,136 @@ IDX_TO_GEM = {i: c for c, i in GEM_TO_IDX.items()}
 
 TAKE_3_DIFF_COMBOS = list(combinations(range(len(GEM_COLORS)), 3))
 
+# Fixed encoding layout sizes (used for color-permutation augmentation)
+CARD_VEC_LEN = 11  # 5 cost + 5 bonus + 1 points
+NUM_TIERS = 3
+CARDS_PER_TIER = 4
+RESERVED_PER_PLAYER = 3
+NOBLES_MAX = 10
+
+
+def _infer_num_players_from_flat_len(n: int) -> int:
+    """Infer player count from flattened length; fall back to 2 if unclear."""
+    base = NUM_TIERS * CARDS_PER_TIER * CARD_VEC_LEN + 6 + NOBLES_MAX * 5
+    per_player = RESERVED_PER_PLAYER * CARD_VEC_LEN + 6 + 5 + 1
+    if n >= base and (n - base) % per_player == 0:
+        return int((n - base) // per_player)
+    return 2
+
+
+def permute_policy_colors(pi: np.ndarray, perm: np.ndarray) -> np.ndarray:
+    """Permute the policy vector under a color relabeling.
+
+    perm is a length-5 array where perm[new_idx] = old_idx.
+    Only actions that depend on gem colors (take tokens) are remapped.
+    """
+    pi_arr = np.asarray(pi, dtype=np.float32)
+    if pi_arr.shape[-1] != 43:
+        return pi_arr
+    perm = np.asarray(perm, dtype=np.int64)
+    if perm.shape[0] != 5:
+        return pi_arr
+
+    # Map new action index -> old action index
+    mapping = _build_action_permutation(perm)
+    # 15-42: color-agnostic actions, unchanged
+    return pi_arr[mapping].astype(np.float32)
+
+
+def _build_action_permutation(perm: np.ndarray) -> list[int]:
+    """Return mapping new_index -> old_index under color permutation."""
+    mapping = list(range(43))
+    combo_to_idx = {cmb: i for i, cmb in enumerate(TAKE_3_DIFF_COMBOS)}
+    # 0-9: take 3 different
+    for new_idx, cmb in enumerate(TAKE_3_DIFF_COMBOS):
+        old_cmb = tuple(sorted(perm[c] for c in cmb))
+        mapping[new_idx] = combo_to_idx[old_cmb]
+    # 10-14: take 2 same color
+    for new_color in range(5):
+        mapping[10 + new_color] = 10 + int(perm[new_color])
+    return mapping
+
+
+def permute_action_index(a_idx: int, perm: np.ndarray) -> int:
+    """Map an action index under a color relabeling."""
+    if a_idx is None or a_idx < 0:
+        return -1
+    if a_idx >= 43:
+        return a_idx
+    perm = np.asarray(perm, dtype=np.int64)
+    if perm.shape[0] != 5:
+        return a_idx
+    mapping = _build_action_permutation(perm)
+    inv = [0] * len(mapping)
+    for new, old in enumerate(mapping):
+        inv[old] = new
+    return int(inv[a_idx])
+
+
+def permute_token_vector(vec: np.ndarray, perm: np.ndarray) -> np.ndarray:
+    """Permute a 6-length token vector (5 colors + gold)."""
+    v = np.asarray(vec, dtype=np.float32)
+    perm = np.asarray(perm, dtype=np.int64)
+    if v.shape[-1] != 6 or perm.shape[0] != 5:
+        return v
+    out = v.copy()
+    out[..., :5] = v[..., :5][..., perm]
+    out[..., 5] = v[..., 5]
+    return out
+
+
+def permute_colors_in_flat_state(flat_state: np.ndarray, perm: np.ndarray, num_players: int | None = None) -> np.ndarray:
+    """Permute all gem-color features in a flattened state.
+
+    perm is a length-5 array where perm[new_idx] = old_idx.
+    Gold (index 5 in token vectors) is not permuted.
+    """
+    orig = np.asarray(flat_state, dtype=np.float32)
+    out = orig.copy()
+    perm = np.asarray(perm, dtype=np.int64)
+    if perm.shape[0] != 5:
+        return out
+
+    n_players = int(num_players) if num_players is not None else _infer_num_players_from_flat_len(len(out))
+
+    idx = 0
+    # Board cards
+    for _ in range(NUM_TIERS * CARDS_PER_TIER):
+        out[idx: idx + 5] = orig[idx: idx + 5][perm]
+        out[idx + 5: idx + 10] = orig[idx + 5: idx + 10][perm]
+        idx += CARD_VEC_LEN
+
+    # Reserved cards (per player)
+    for _ in range(n_players * RESERVED_PER_PLAYER):
+        out[idx: idx + 5] = orig[idx: idx + 5][perm]
+        out[idx + 5: idx + 10] = orig[idx + 5: idx + 10][perm]
+        idx += CARD_VEC_LEN
+
+    # Player data blocks
+    for _ in range(n_players):
+        # Tokens (5 colors + gold)
+        out[idx: idx + 5] = orig[idx: idx + 5][perm]
+        out[idx + 5] = orig[idx + 5]
+        idx += 6
+        # Bonuses (5 colors)
+        out[idx: idx + 5] = orig[idx: idx + 5][perm]
+        idx += 5
+        # Points (1)
+        out[idx] = orig[idx]
+        idx += 1
+
+    # Bank tokens (5 colors + gold)
+    out[idx: idx + 5] = orig[idx: idx + 5][perm]
+    out[idx + 5] = orig[idx + 5]
+    idx += 6
+
+    # Nobles (10 * 5 colors)
+    for _ in range(NOBLES_MAX):
+        out[idx: idx + 5] = orig[idx: idx + 5][perm]
+        idx += 5
+
+    return out
+
 
 ##### input of neural network: action to index
 
@@ -230,11 +360,31 @@ def index_to_action(index: int, game_state: GameState) -> Action:
 
 ####### flatten game state
 
+def _players_in_turn_order(game_state: GameState):
+    """Return players rotated so current_player is first.
+
+    Rationale: the network should always see the position from the
+    perspective of the player to move. This removes label ambiguity
+    where identical inputs would otherwise require different outputs.
+    """
+    try:
+        n = len(game_state.players)
+        if n <= 1:
+            return list(game_state.players)
+        cp = int(getattr(game_state, "current_player", 0)) % n
+        return list(game_state.players[cp:]) + list(game_state.players[:cp])
+    except Exception:
+        # Fallback to original order if anything is unexpected.
+        return list(game_state.players)
+
+
 def flatten_game_state(game_state):
     flat_state = []
+    # Always encode players from the current player's perspective.
+    players = _players_in_turn_order(game_state)
 
     # --- Board Cards (4 cards per tier, 3 tiers = 12 cards) ---
-    for tier in game_state.board:
+    for tier in sorted(game_state.board.keys()):
         cards_in_tier = game_state.board[tier]
         # Encode at most 4 visible cards per tier
         for card in cards_in_tier[:4]:
@@ -247,7 +397,7 @@ def flatten_game_state(game_state):
             flat_state.extend([0] * (5 + 5 + 1))  # cost + bonus + points
 
     # --- Reserved Cards (up to 3 per player) ---
-    for player in game_state.players:
+    for player in players:
         reserved_cards = getattr(player, "reserved", [])  # adjusted attr name if needed
         for card in reserved_cards:
             if card is None:
@@ -258,7 +408,7 @@ def flatten_game_state(game_state):
             flat_state.extend([0] * (5 + 5 + 1))
 
     # --- Player Data ---
-    for player in game_state.players:
+    for player in players:
         # Tokens (6 types)
         flat_state.extend([player.tokens.get(token, 0) for token in ["diamond", "sapphire", "obsidian", "ruby", "emerald", "gold"]])
         # Card bonuses (5 types)
