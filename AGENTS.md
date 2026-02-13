@@ -27,6 +27,21 @@
   - same value scalar
   - same return-choice head API for conditional token-return scoring
 
+### Attention-v2 additions (2026-02-12)
+- Added stronger token identity features:
+  - board tier embedding + board slot embedding
+  - reserved-slot embedding
+  - noble-slot embedding
+- Strengthened masking behavior:
+  - padding masks now also gate opponent-specific aggregate tokens when absent
+  - empty board/reserved slots are damped in policy feature paths
+  - structurally invalid token-dependent action logits are strongly down-biased
+- Added evaluation diagnostics in `az_train` logging:
+  - average legal action count (`diag_g_legal_n`)
+  - mean top-1 legal policy probability (`diag_g_top1_legal`)
+  - mean policy mass by action family (`take`, `buy_vis`, `buy_res`, `reserve`)
+  - these are appended to `logs/train_log.csv` and printed per-iteration as `diag_g(...)`
+
 ## Checkpoint Compatibility
 - MLP-era checkpoints from other branches are generally **not shape-compatible** with the attention model.
 - For clean attention runs, prefer `resume=False` or resume only from checkpoints created by this attention architecture.
@@ -63,4 +78,5 @@
 
 ### Benchmark Example
 - `python benchmark_attention_vs_baseline.py --seeds 0,1 --games-random 20 --games-greedy 20 --mcts-simulations 128 --mcts-batch 16 --device cpu`
+- For AMD/Intel GPU via DirectML, use `--device dml`.
 

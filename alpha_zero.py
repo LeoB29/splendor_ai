@@ -4,6 +4,7 @@ import os
 import csv
 import random
 import json
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -195,6 +196,23 @@ class PolicyValueNet(nn.Module):
         self.type_emb = nn.Embedding(8, self.width)
         # 0 cls, 1 board, 2 self-res, 3 nobles, 4 self-player, 5 opp-player, 6 bank, 7 opp-res-pool
 
+        # Stronger token identity embeddings.
+        self.board_tier_emb = nn.Embedding(NUM_TIERS, self.width)
+        self.board_slot_emb = nn.Embedding(CARDS_PER_TIER, self.width)
+        self.res_slot_emb = nn.Embedding(self.n_res_self, self.width)
+        self.noble_slot_emb = nn.Embedding(self.n_nobles, self.width)
+
+        board_tier_ids: list[int] = []
+        board_slot_ids: list[int] = []
+        for t in range(NUM_TIERS):
+            for s in range(CARDS_PER_TIER):
+                board_tier_ids.append(t)
+                board_slot_ids.append(s)
+        self.register_buffer("board_tier_ids", torch.tensor(board_tier_ids, dtype=torch.long), persistent=False)
+        self.register_buffer("board_slot_ids", torch.tensor(board_slot_ids, dtype=torch.long), persistent=False)
+        self.register_buffer("res_slot_ids", torch.arange(self.n_res_self, dtype=torch.long), persistent=False)
+        self.register_buffer("noble_slot_ids", torch.arange(self.n_nobles, dtype=torch.long), persistent=False)
+
         self.blocks = nn.ModuleList([AttentionBlock(self.width, n_heads=n_heads) for _ in range(max(1, int(n_blocks)))])
         self.final_ln = nn.LayerNorm(self.width)
 
@@ -242,6 +260,10 @@ class PolicyValueNet(nn.Module):
         nn.init.normal_(self.res_pos, mean=0.0, std=0.02)
         nn.init.normal_(self.noble_pos, mean=0.0, std=0.02)
         nn.init.normal_(self.type_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.board_tier_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.board_slot_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.res_slot_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.noble_slot_emb.weight, mean=0.0, std=0.02)
 
     @staticmethod
     def _pick_num_heads(width: int) -> int:
@@ -318,14 +340,23 @@ class PolicyValueNet(nn.Module):
             opp_res_valid = res_valid[:, 1:].reshape(bsz, (n_players - 1) * RESERVED_PER_PLAYER)
             opp_res_tok_raw = self.card_encoder(opp_res)
             opp_res_pool = self._masked_mean(opp_res_tok_raw, opp_res_valid).unsqueeze(1)
+            opp_player_valid = torch.ones((bsz, 1), dtype=torch.bool, device=device)
+            opp_res_pool_valid = opp_res_valid.any(dim=1, keepdim=True)
         else:
             opp_player_tok = torch.zeros_like(self_player_tok)
             opp_res_pool = torch.zeros_like(self_player_tok)
+            opp_player_valid = torch.zeros((bsz, 1), dtype=torch.bool, device=device)
+            opp_res_pool_valid = torch.zeros((bsz, 1), dtype=torch.bool, device=device)
+
+        board_tier_e = self.board_tier_emb(self.board_tier_ids).unsqueeze(0)
+        board_slot_e = self.board_slot_emb(self.board_slot_ids).unsqueeze(0)
+        res_slot_e = self.res_slot_emb(self.res_slot_ids).unsqueeze(0)
+        noble_slot_e = self.noble_slot_emb(self.noble_slot_ids).unsqueeze(0)
 
         # Add position + type metadata
-        board_tok = board_tok + self.board_pos + self._type(bsz, 1, self.n_board, device)
-        self_res_tok = self_res_tok + self.res_pos + self._type(bsz, 2, self.n_res_self, device)
-        noble_tok = noble_tok + self.noble_pos + self._type(bsz, 3, self.n_nobles, device)
+        board_tok = board_tok + self.board_pos + board_tier_e + board_slot_e + self._type(bsz, 1, self.n_board, device)
+        self_res_tok = self_res_tok + self.res_pos + res_slot_e + self._type(bsz, 2, self.n_res_self, device)
+        noble_tok = noble_tok + self.noble_pos + noble_slot_e + self._type(bsz, 3, self.n_nobles, device)
         self_player_tok = self_player_tok + self._type(bsz, 4, 1, device)
         opp_player_tok = opp_player_tok + self._type(bsz, 5, 1, device)
         bank_tok = bank_tok + self._type(bsz, 6, 1, device)
@@ -354,7 +385,10 @@ class PolicyValueNet(nn.Module):
                 ~board_valid,                                              # board
                 ~res_valid[:, 0],                                          # self reserved
                 ~noble_valid,                                              # nobles
-                torch.zeros(bsz, 4, dtype=torch.bool, device=device),      # player/bank/pool tokens
+                torch.zeros((bsz, 1), dtype=torch.bool, device=device),    # self-player
+                ~opp_player_valid,                                         # opp-player (absent in 1p)
+                torch.zeros((bsz, 1), dtype=torch.bool, device=device),    # bank
+                ~opp_res_pool_valid,                                       # opp-reserved pool
             ],
             dim=1,
         )
@@ -366,6 +400,10 @@ class PolicyValueNet(nn.Module):
         cls = seq[:, 0]
         board_ctx = seq[:, 1: 1 + self.n_board]
         self_res_ctx = seq[:, 1 + self.n_board: 1 + self.n_board + self.n_res_self]
+
+        # Empty slots should not contribute non-informative policy features.
+        board_ctx = board_ctx * board_valid.unsqueeze(-1).to(dtype=board_ctx.dtype)
+        self_res_ctx = self_res_ctx * res_valid[:, 0].unsqueeze(-1).to(dtype=self_res_ctx.dtype)
 
         # Policy heads
         global_logits = self.policy_global(cls)
@@ -380,9 +418,10 @@ class PolicyValueNet(nn.Module):
         # Assemble logits in fixed action order
         logits = torch.zeros(bsz, self.action_size, device=device, dtype=x.dtype)
         logits[:, 0:15] = global_logits[:, 0:15]
-        logits[:, 15:27] = buy_vis
-        logits[:, 27:30] = buy_res
-        logits[:, 30:42] = reserve_vis
+        neg_large = torch.full_like(buy_vis, -1.0e4)
+        logits[:, 15:27] = torch.where(board_valid, buy_vis, neg_large)
+        logits[:, 27:30] = torch.where(res_valid[:, 0], buy_res, torch.full_like(buy_res, -1.0e4))
+        logits[:, 30:42] = torch.where(board_valid, reserve_vis, neg_large)
         logits[:, 42] = global_logits[:, 15]
 
         value = self.value_head(cls).squeeze(-1)
@@ -984,7 +1023,12 @@ def _load_ckpt_model(path: str, device: Any, input_size: int, action_size: int, 
                 _allowlist_checkpoint_globals()
                 ck = torch.load(cand, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
             sd = ck.get("model", ck)
-            model.load_state_dict(sd)
+            incompat = model.load_state_dict(sd, strict=False)
+            if getattr(incompat, "missing_keys", None) or getattr(incompat, "unexpected_keys", None):
+                print(
+                    f"[Arena] Non-strict checkpoint load for {os.path.basename(cand)} "
+                    f"(missing={len(incompat.missing_keys)}, unexpected={len(incompat.unexpected_keys)})"
+                )
             if cand != path:
                 print(f"[Arena] Loaded fallback model-only checkpoint: {cand}")
             return model.to(device)
@@ -1645,8 +1689,68 @@ def _save_elo_pool(path: str, pool: List[Dict[str, Any]]) -> None:
         pass
 
 
-def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: int = 32, device: str = "cpu", mcts_batch: int = 16, max_moves: int = 250) -> float:
+_FAMILY_SLICE = {
+    "take": list(range(0, 15)) + [42],
+    "buy_vis": list(range(15, 27)),
+    "buy_res": list(range(27, 30)),
+    "reserve": list(range(30, 42)),
+}
+
+
+def _new_eval_policy_diag() -> Dict[str, float]:
+    return {
+        "moves": 0.0,
+        "legal_count_sum": 0.0,
+        "top1_legal_sum": 0.0,
+        "mass_take_sum": 0.0,
+        "mass_buy_vis_sum": 0.0,
+        "mass_buy_res_sum": 0.0,
+        "mass_reserve_sum": 0.0,
+    }
+
+
+def _accum_eval_policy_diag(diag: Dict[str, float], pi: np.ndarray, legal_mask: np.ndarray) -> None:
+    p = np.asarray(pi, dtype=np.float64)
+    lm = np.asarray(legal_mask, dtype=np.float64)
+    legal_n = float(np.clip(lm.sum(), 0.0, 43.0))
+    legal_p = p * lm
+    s = float(legal_p.sum())
+    if s > 0.0:
+        legal_p = legal_p / s
+    top1_legal = float(legal_p.max()) if legal_n > 0 else 0.0
+    diag["moves"] += 1.0
+    diag["legal_count_sum"] += legal_n
+    diag["top1_legal_sum"] += top1_legal
+    diag["mass_take_sum"] += float(p[_FAMILY_SLICE["take"]].sum())
+    diag["mass_buy_vis_sum"] += float(p[_FAMILY_SLICE["buy_vis"]].sum())
+    diag["mass_buy_res_sum"] += float(p[_FAMILY_SLICE["buy_res"]].sum())
+    diag["mass_reserve_sum"] += float(p[_FAMILY_SLICE["reserve"]].sum())
+
+
+def _finalize_eval_policy_diag(diag: Dict[str, float]) -> Dict[str, float]:
+    moves = max(1.0, float(diag.get("moves", 0.0)))
+    return {
+        "moves": float(diag.get("moves", 0.0)),
+        "legal_count_mean": float(diag.get("legal_count_sum", 0.0) / moves),
+        "top1_legal_mean": float(diag.get("top1_legal_sum", 0.0) / moves),
+        "mass_take_mean": float(diag.get("mass_take_sum", 0.0) / moves),
+        "mass_buy_vis_mean": float(diag.get("mass_buy_vis_sum", 0.0) / moves),
+        "mass_buy_res_mean": float(diag.get("mass_buy_res_sum", 0.0) / moves),
+        "mass_reserve_mean": float(diag.get("mass_reserve_sum", 0.0) / moves),
+    }
+
+
+def evaluate_vs_random(
+    model: PolicyValueNet,
+    games: int = 4,
+    mcts_simulations: int = 32,
+    device: str = "cpu",
+    mcts_batch: int = 16,
+    max_moves: int = 250,
+    return_diagnostics: bool = False,
+):
     wins = 0
+    diag = _new_eval_policy_diag()
     for g in range(games):
         state = setup_game(num_players=2)
         mcts = AlphaZeroMCTS(model, device=device, n_simulations=mcts_simulations, mcts_batch=mcts_batch)
@@ -1671,6 +1775,7 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
             played_a_idx: Optional[int] = None
             if state.current_player == my_index:
                 pi, a_idx = mcts.run(state, temperature=0.0)  # argmax over visits
+                _accum_eval_policy_diag(diag, pi, np.array(legal_actions_mask(state), dtype=np.float32))
                 if a_idx == -1:
                     # fallback to random legal
                     a = random.choice(legal)
@@ -1713,7 +1818,10 @@ def evaluate_vs_random(model: PolicyValueNet, games: int = 4, mcts_simulations: 
         interval = max(1, games // 10)
         if ((g + 1) % interval == 0) or (g + 1 == games):
             print(f"[Eval] {g+1}/{games} games done")
-    return wins / games if games > 0 else 0.0
+    wr = wins / games if games > 0 else 0.0
+    if return_diagnostics:
+        return wr, _finalize_eval_policy_diag(diag)
+    return wr
 
 
 def _greedy_action(state: GameState) -> Action:
@@ -1774,10 +1882,19 @@ def _greedy_action(state: GameState) -> Action:
     return best if best is not None else legal[0]
 
 
-def evaluate_vs_greedy(model: PolicyValueNet, games: int = 50, mcts_simulations: int = 64, device: str = "cpu", mcts_batch: int = 16, max_moves: int = 250) -> tuple[float, float, float]:
+def evaluate_vs_greedy(
+    model: PolicyValueNet,
+    games: int = 50,
+    mcts_simulations: int = 64,
+    device: str = "cpu",
+    mcts_batch: int = 16,
+    max_moves: int = 250,
+    return_diagnostics: bool = False,
+):
     wins = 0
     margins = []
     lengths = []
+    diag = _new_eval_policy_diag()
     for g in range(games):
         state = setup_game(num_players=2)
         mcts = AlphaZeroMCTS(model, device=device, n_simulations=mcts_simulations, mcts_batch=mcts_batch)
@@ -1797,7 +1914,8 @@ def evaluate_vs_greedy(model: PolicyValueNet, games: int = 50, mcts_simulations:
                 continue
             played_a_idx: Optional[int] = None
             if state.current_player == my_index:
-                _, a_idx = mcts.run(state, temperature=0.0)
+                pi, a_idx = mcts.run(state, temperature=0.0)
+                _accum_eval_policy_diag(diag, pi, np.array(legal_actions_mask(state), dtype=np.float32))
                 if a_idx == -1:
                     a = legal[0]
                     played_a_idx = None
@@ -1843,6 +1961,8 @@ def evaluate_vs_greedy(model: PolicyValueNet, games: int = 50, mcts_simulations:
     win_rate = wins / games if games > 0 else 0.0
     avg_margin = float(np.mean(margins)) if margins else 0.0
     avg_len = float(np.mean(lengths)) if lengths else 0.0
+    if return_diagnostics:
+        return win_rate, avg_margin, avg_len, _finalize_eval_policy_diag(diag)
     return win_rate, avg_margin, avg_len
 
 
@@ -1922,11 +2042,17 @@ def az_train(
     # Parallel self-play
     selfplay_workers: int = 0,
     selfplay_device: Optional[str] = None,
+    # Eval diagnostics: summarize policy behavior by action family and legality.
+    log_policy_diagnostics: bool = True,
 ):
     # Setup
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
-    expected_train_header = "iter,buffer,avg_steps,loss,policy_loss,value_loss,return_loss,win_rand,win_greedy,margin_g,len_g"
+    expected_train_header = (
+        "iter,buffer,avg_steps,loss,policy_loss,value_loss,return_loss,"
+        "win_rand,win_greedy,margin_g,len_g,"
+        "diag_g_legal_n,diag_g_top1_legal,diag_g_take,diag_g_buy_vis,diag_g_buy_res,diag_g_reserve"
+    )
     log_path = os.path.join(log_dir, "train_log.csv")
     write_header = not os.path.exists(log_path)
     # Keep a single canonical log file by migrating legacy schemas in place.
@@ -2084,7 +2210,12 @@ def az_train(
         try:
             ck = _load_checkpoint_cpu_safe(path)
             sd = ck.get("model", ck)
-            model.load_state_dict(sd)
+            incompat = model.load_state_dict(sd, strict=False)
+            if getattr(incompat, "missing_keys", None) or getattr(incompat, "unexpected_keys", None):
+                warnings.warn(
+                    f"[Resume] Non-strict load for model-only checkpoint {path} "
+                    f"(missing={len(incompat.missing_keys)}, unexpected={len(incompat.unexpected_keys)})"
+                )
             start_iter_global = int(ck.get("iter", iter_hint))
             print(f"[Resume] Loaded model-only checkpoint {path} @ iter {start_iter_global} (optimizer reset)")
             return True
@@ -2098,7 +2229,12 @@ def az_train(
             try:
                 # Load safely on CPU, then move to target device
                 ck = _load_checkpoint_cpu_safe(resume_path)
-                model.load_state_dict(ck["model"])
+                incompat = model.load_state_dict(ck["model"], strict=False)
+                if getattr(incompat, "missing_keys", None) or getattr(incompat, "unexpected_keys", None):
+                    warnings.warn(
+                        f"[Resume] Non-strict full-checkpoint load {resume_path} "
+                        f"(missing={len(incompat.missing_keys)}, unexpected={len(incompat.unexpected_keys)})"
+                    )
                 if resume_optimizer_state and ("optimizer" in ck):
                     optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
                     _configure_optimizer_for_device(optimizer, device)
@@ -2134,7 +2270,12 @@ def az_train(
                 path, itnum = latest
                 try:
                     ck = _load_checkpoint_cpu_safe(path)
-                    model.load_state_dict(ck["model"])
+                    incompat = model.load_state_dict(ck["model"], strict=False)
+                    if getattr(incompat, "missing_keys", None) or getattr(incompat, "unexpected_keys", None):
+                        warnings.warn(
+                            f"[Resume] Non-strict latest-checkpoint load {path} "
+                            f"(missing={len(incompat.missing_keys)}, unexpected={len(incompat.unexpected_keys)})"
+                        )
                     if resume_optimizer_state and ("optimizer" in ck):
                         optimizer.load_state_dict(ck["optimizer"])  # type: ignore[arg-type]
                         _configure_optimizer_for_device(optimizer, device)
@@ -2394,21 +2535,42 @@ def az_train(
 
         # Evaluate vs random (and greedy for extra signal)
         print(f"[Iter {it}] Eval: {eval_games} games vs random")
-        win_rate = evaluate_vs_random(
-            model,
-            games=eval_games,
-            mcts_simulations=mcts_simulations,  # full sims for eval
-            device=device,
-            mcts_batch=mcts_batch,
-        )
+        if log_policy_diagnostics:
+            win_rate, _diag_rand = evaluate_vs_random(
+                model,
+                games=eval_games,
+                mcts_simulations=mcts_simulations,  # full sims for eval
+                device=device,
+                mcts_batch=mcts_batch,
+                return_diagnostics=True,
+            )
+        else:
+            win_rate = evaluate_vs_random(
+                model,
+                games=eval_games,
+                mcts_simulations=mcts_simulations,  # full sims for eval
+                device=device,
+                mcts_batch=mcts_batch,
+            )
         print(f"[Iter {it}] Eval: {eval_games} games vs greedy")
-        win_g, margin_g, len_g = evaluate_vs_greedy(
-            model,
-            games=eval_games,
-            mcts_simulations=mcts_simulations,  # full sims for eval
-            device=device,
-            mcts_batch=mcts_batch,
-        )
+        if log_policy_diagnostics:
+            win_g, margin_g, len_g, diag_g = evaluate_vs_greedy(
+                model,
+                games=eval_games,
+                mcts_simulations=mcts_simulations,  # full sims for eval
+                device=device,
+                mcts_batch=mcts_batch,
+                return_diagnostics=True,
+            )
+        else:
+            win_g, margin_g, len_g = evaluate_vs_greedy(
+                model,
+                games=eval_games,
+                mcts_simulations=mcts_simulations,  # full sims for eval
+                device=device,
+                mcts_batch=mcts_batch,
+            )
+            diag_g = _finalize_eval_policy_diag(_new_eval_policy_diag())
 
         # Save checkpoint (full + model-only for safe arena/ladder loading)
         ckpt_path = os.path.join(ckpt_dir, f"az_iter_{it}.pt")
@@ -2539,14 +2701,32 @@ def az_train(
         with open(log_path, "a", newline="") as f:
             writer = csv.writer(f)
             if write_header:
-                writer.writerow(["iter", "buffer", "avg_steps", "loss", "policy_loss", "value_loss", "return_loss", "win_rand", "win_greedy", "margin_g", "len_g"])
+                writer.writerow([
+                    "iter", "buffer", "avg_steps", "loss", "policy_loss", "value_loss", "return_loss",
+                    "win_rand", "win_greedy", "margin_g", "len_g",
+                    "diag_g_legal_n", "diag_g_top1_legal", "diag_g_take", "diag_g_buy_vis", "diag_g_buy_res", "diag_g_reserve",
+                ])
                 write_header = False
-            writer.writerow([it, buffer.size(), f"{avg_steps:.2f}", f"{avg_loss:.4f}", f"{avg_pl:.4f}", f"{avg_vl:.4f}", f"{avg_rl:.4f}", f"{win_rate:.3f}", f"{win_g:.3f}", f"{margin_g:.3f}", f"{len_g:.2f}"])
+            writer.writerow([
+                it, buffer.size(), f"{avg_steps:.2f}", f"{avg_loss:.4f}", f"{avg_pl:.4f}", f"{avg_vl:.4f}", f"{avg_rl:.4f}",
+                f"{win_rate:.3f}", f"{win_g:.3f}", f"{margin_g:.3f}", f"{len_g:.2f}",
+                f"{diag_g.get('legal_count_mean', 0.0):.2f}",
+                f"{diag_g.get('top1_legal_mean', 0.0):.3f}",
+                f"{diag_g.get('mass_take_mean', 0.0):.3f}",
+                f"{diag_g.get('mass_buy_vis_mean', 0.0):.3f}",
+                f"{diag_g.get('mass_buy_res_mean', 0.0):.3f}",
+                f"{diag_g.get('mass_reserve_mean', 0.0):.3f}",
+            ])
 
         print(
             f"Iter {it:02d} | buffer={buffer.size()} steps={avg_steps:.1f} "
             f"loss={avg_loss:.4f} pol={avg_pl:.4f} val={avg_vl:.4f} ret={avg_rl:.4f} "
-            f"win%_rand={win_rate:.1%} win%_greedy={win_g:.1%} margin_g={margin_g:.2f} len_g={len_g:.1f}"
+            f"win%_rand={win_rate:.1%} win%_greedy={win_g:.1%} margin_g={margin_g:.2f} len_g={len_g:.1f} "
+            f"diag_g(legal={diag_g.get('legal_count_mean', 0.0):.1f}, top1={diag_g.get('top1_legal_mean', 0.0):.2f}, "
+            f"mass t/bv/br/rv={diag_g.get('mass_take_mean', 0.0):.2f}/"
+            f"{diag_g.get('mass_buy_vis_mean', 0.0):.2f}/"
+            f"{diag_g.get('mass_buy_res_mean', 0.0):.2f}/"
+            f"{diag_g.get('mass_reserve_mean', 0.0):.2f})"
         )
 
         # Print only a short tail of the CSV log for readability

@@ -2,6 +2,33 @@
 Log of changes and rationale (most recent first).
 
 ## 2026-02-12
+### Attention-v2: masking, identity embeddings, policy diagnostics
+- Implemented three targeted upgrades in `alpha_zero.py`:
+  1. **Padding/masking improvements**
+     - Extended token padding behavior to cover opponent-aggregate tokens when absent.
+     - Dampened empty board/self-reserved token features before policy projection.
+     - Applied strong negative bias to structurally invalid token-dependent action logits (empty board/reserved slots).
+  2. **Stronger token identity embeddings**
+     - Added board-tier and board-slot embeddings (factorized board identity).
+     - Added reserved-slot and noble-slot embeddings.
+     - Kept action interface fixed at 43 actions.
+  3. **Policy diagnostics for eval loops**
+     - Added per-move policy diagnostics collection in `evaluate_vs_random` / `evaluate_vs_greedy` (opt-in).
+     - `az_train` now logs greedy-eval diagnostics each iteration:
+       - `diag_g_legal_n` (mean legal action count)
+       - `diag_g_top1_legal` (mean top-1 legal policy probability)
+       - family mass means: `diag_g_take`, `diag_g_buy_vis`, `diag_g_buy_res`, `diag_g_reserve`
+     - Iter print now includes `diag_g(...)` summary for fast diagnosis of policy collapse/mode bias.
+- Resume/load robustness:
+  - Switched multiple checkpoint load paths to non-strict loading with warning output on missing/unexpected keys to tolerate incremental architecture evolution.
+
+### Validation run for attention-v2 changes
+- `python -m py_compile alpha_zero.py` passed.
+- `python test_alpha_zero_smoke.py` passed.
+- Added diagnostics-path smoke:
+  - `evaluate_vs_random(..., return_diagnostics=True)` and `evaluate_vs_greedy(..., return_diagnostics=True)` execute and return expected metric dicts.
+- Tiny end-to-end `az_train` run (1 iter, tiny settings) succeeded and wrote new diagnostic columns to `logs/_tmp_diag_check/train_log.csv`.
+
 ### Attention architecture migration (attention branch)
 - Replaced the pooled/residual MLP encoder in `alpha_zero.py::PolicyValueNet` with a transformer-style token-attention encoder.
 - Added `AttentionBlock` (pre-LN multi-head self-attention + FFN) and stacked it in `PolicyValueNet`.
