@@ -1,6 +1,57 @@
 # Master Notes
 Log of changes and rationale (most recent first).
 
+## 2026-02-14
+### Stability ramp profile for attention training (A1/A2)
+- Implemented a new early-iteration stability ramp in `az_train` (`alpha_zero.py`):
+  - New knobs:
+    - `stability_ramp`
+    - `ramp_min_buffer`
+    - `ramp_iters`
+    - `ramp_batch_frac_start`
+    - `ramp_divergence_policy_start`
+    - `ramp_divergence_total_start`
+    - `ramp_max_skips_start`
+  - Behavior when enabled:
+    - skips training while replay buffer is below `ramp_min_buffer`
+    - ramps train batches from a low fraction to full batches over `ramp_iters`
+    - starts with looser divergence thresholds and anneals down to configured strict thresholds
+    - starts with a higher skip budget and anneals to the configured budget
+  - Added explicit ramp logging each iteration:
+    - current ramp progress `t`
+    - effective train batch count
+    - effective divergence thresholds
+    - effective max skip count
+- Added a new default launcher profile in `train_attention_dml.py`:
+  - `PROFILE = "ramp"` by default
+  - New profile name: `ATTENTION-RAMP`
+  - Tuned for early stability:
+    - lower base LR (`2.0e-5`)
+    - `stability_ramp=True`
+    - `ramp_min_buffer=12000`
+    - `ramp_iters=8`
+    - `ramp_batch_frac_start=0.25`
+    - `ramp_divergence_policy_start=14.0`
+    - `ramp_divergence_total_start=18.0`
+    - `ramp_max_skips_start=2`
+- Applied the same code changes to all active ablation worktrees to keep comparisons fair:
+  - `splendor_ai_attn_a1`
+  - `splendor_ai_attn_a2`
+  - `splendor_ai_attention` (main attention worktree)
+
+### Live run metadata snapshot (A2 ramp run)
+- Captured during active training process:
+  - `PID=22080`
+  - `start=2026-02-14 12:35:29` (local time)
+  - command: `python .\train_attention_dml.py`
+- Run launcher/profile signals (A2 worktree):
+  - `PROFILE="ramp"` in `train_attention_dml.py`
+  - prints `"[Profile] Using ATTENTION-RAMP profile"`
+  - includes `stability_ramp=True`, `ramp_min_buffer=12000`, `ramp_iters=8`
+- File fingerprints for reproducibility (A2 worktree):
+  - `alpha_zero.py` SHA256: `2C2603065603C8D47948E5227961ED45C842C8E6E67B18530D22A5A87AF4BE2F`
+  - `train_attention_dml.py` SHA256: `D5D32EC3883C0744ACC00846F98D75C4926726FEFB2C0B7FAC617A4233212E3F`
+
 ## 2026-02-12
 ### Attention-v2: masking, identity embeddings, policy diagnostics
 - Implemented three targeted upgrades in `alpha_zero.py`:

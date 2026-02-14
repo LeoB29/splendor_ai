@@ -70,7 +70,11 @@
 ## Attention Branch Scripts
 - `train_attention_dml.py`
   - Dedicated DirectML training launcher tuned for the attention architecture.
-  - Profiles: `stable` (default) and `progress`.
+  - Profiles: `ramp` (default), `stable`, `progress`.
+  - `ramp` is recommended for fresh runs; it reduces early divergence by:
+    - delaying training until replay has enough samples
+    - using fewer train batches in early iterations
+    - using relaxed divergence thresholds early, then annealing to strict values
 - `benchmark_attention_vs_baseline.py`
   - Cross-repo benchmark orchestrator (attention vs baseline) using fixed seeds.
   - Compares win rates vs random/greedy and reports deltas plus Elo-proxy deltas.

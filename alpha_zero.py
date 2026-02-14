@@ -2026,6 +2026,14 @@ def az_train(
     divergence_min_lr: float = 1e-6,
     divergence_max_skips_per_iter: int = 3,
     divergence_rollback: bool = True,
+    # Stability ramp: reduce early-iteration train pressure until replay is populated.
+    stability_ramp: bool = False,
+    ramp_min_buffer: int = 0,
+    ramp_iters: int = 1,
+    ramp_batch_frac_start: float = 1.0,
+    ramp_divergence_policy_start: float = 50.0,
+    ramp_divergence_total_start: float = 200.0,
+    ramp_max_skips_start: int = 3,
     # Model architecture
     width: int = 512,
     res_blocks: int = 6,
@@ -2416,13 +2424,47 @@ def az_train(
         val_losses = []
         ret_losses = []
         skipped_batches = 0
+        ramp_skipped_training = False
         # Rollback snapshot in case repeated divergence is detected within this iteration.
         pre_train_model_sd = _model_state_dict_cpu(model)
         try:
             pre_train_opt_sd = copy.deepcopy(optimizer.state_dict())
         except Exception:
             pre_train_opt_sd = None
-        print(f"[Iter {it}] Train: {train_batches_per_iter} batches (buffer={buffer.size()})")
+        eff_train_batches = int(train_batches_per_iter)
+        eff_div_pol = float(divergence_policy_loss)
+        eff_div_tot = float(divergence_total_loss)
+        eff_max_skips = int(divergence_max_skips_per_iter)
+        if stability_ramp:
+            if int(ramp_min_buffer) > 0 and int(buffer.size()) < int(ramp_min_buffer):
+                ramp_skipped_training = True
+                eff_train_batches = 0
+                print(
+                    f"[Ramp] Iter {it}: skip training (buffer={buffer.size()} < min={int(ramp_min_buffer)})"
+                )
+            else:
+                t = 1.0
+                if int(ramp_iters) > 1:
+                    t = max(0.0, min(1.0, float(step - 1) / float(int(ramp_iters) - 1)))
+                frac0 = max(0.05, min(1.0, float(ramp_batch_frac_start)))
+                start_batches = max(1, int(round(float(train_batches_per_iter) * frac0)))
+                eff_train_batches = int(round(start_batches + (int(train_batches_per_iter) - start_batches) * t))
+                eff_train_batches = max(1, min(int(train_batches_per_iter), eff_train_batches))
+
+                pol0 = max(float(divergence_policy_loss), float(ramp_divergence_policy_start))
+                tot0 = max(float(divergence_total_loss), float(ramp_divergence_total_start))
+                eff_div_pol = float(pol0 + (float(divergence_policy_loss) - pol0) * t)
+                eff_div_tot = float(tot0 + (float(divergence_total_loss) - tot0) * t)
+
+                skips0 = max(int(divergence_max_skips_per_iter), int(ramp_max_skips_start))
+                eff_max_skips = int(round(skips0 + (int(divergence_max_skips_per_iter) - skips0) * t))
+                eff_max_skips = max(1, eff_max_skips)
+                print(
+                    f"[Ramp] Iter {it}: t={t:.2f} batches={eff_train_batches}/{train_batches_per_iter} "
+                    f"div_pol={eff_div_pol:.2f} div_tot={eff_div_tot:.2f} max_skips={eff_max_skips}"
+                )
+
+        print(f"[Iter {it}] Train: {eff_train_batches} batches (buffer={buffer.size()})")
         # Entropy coefficient (linear anneal)
         ent_coef = 0.0
         try:
@@ -2442,7 +2484,7 @@ def az_train(
         except Exception:
             eff_value_weight = value_weight
 
-        for bi in range(train_batches_per_iter):
+        for bi in range(eff_train_batches):
             if buffer.size() == 0:
                 break
             batch = buffer.sample(batch_size)
@@ -2457,8 +2499,8 @@ def az_train(
                 grad_clip=grad_clip,
                 scaler=scaler,
                 entropy_coef=ent_coef,
-                max_policy_loss=divergence_policy_loss,
-                max_total_loss=divergence_total_loss,
+                max_policy_loss=eff_div_pol,
+                max_total_loss=eff_div_tot,
             )
             if float(stats.get("skipped", 0.0)) > 0.5:
                 skipped_batches += 1
@@ -2475,13 +2517,13 @@ def az_train(
                 except Exception:
                     pass
                 print(
-                    f"[Guard] Skipped divergent batch {bi+1}/{train_batches_per_iter} "
+                    f"[Guard] Skipped divergent batch {bi+1}/{eff_train_batches} "
                     f"(policy={stats.get('policy_loss', float('nan')):.4f}, "
                     f"loss={stats.get('loss', float('nan')):.4f}); "
                     f"lr {old_lr if old_lr is not None else float('nan'):.2e} -> "
                     f"{new_lr if new_lr is not None else float('nan'):.2e}"
                 )
-                if skipped_batches >= int(divergence_max_skips_per_iter):
+                if skipped_batches >= int(eff_max_skips):
                     print(f"[Guard] Reached {skipped_batches} skipped batches in iter {it}")
                     if divergence_rollback:
                         try:
@@ -2510,14 +2552,14 @@ def az_train(
             pol_losses.append(stats["policy_loss"])
             val_losses.append(stats["value_loss"])
             ret_losses.append(stats.get("return_loss", 0.0))
-            interval = max(1, train_batches_per_iter // 5)
-            if ((bi + 1) % interval == 0) or (bi + 1 == train_batches_per_iter):
+            interval = max(1, max(1, eff_train_batches) // 5)
+            if ((bi + 1) % interval == 0) or (bi + 1 == eff_train_batches):
                 # Also report LR and entropy coef occasionally
                 try:
                     cur_lr = optimizer.param_groups[0]["lr"]
                 except Exception:
                     cur_lr = lr
-                print(f"[Iter {it}] Train {bi+1}/{train_batches_per_iter} loss={stats['loss']:.4f} lr={cur_lr:.2e} ent={ent_coef:.4f}")
+                print(f"[Iter {it}] Train {bi+1}/{eff_train_batches} loss={stats['loss']:.4f} lr={cur_lr:.2e} ent={ent_coef:.4f}")
 
         if losses:
             avg_loss = float(np.mean(losses))
@@ -2529,7 +2571,9 @@ def az_train(
             avg_pl = 0.0
             avg_vl = 0.0
             avg_rl = 0.0
-            if skipped_batches > 0:
+            if ramp_skipped_training:
+                print(f"[Ramp] No optimizer steps in iter {it} (buffer warmup)")
+            elif skipped_batches > 0:
                 print(f"[Guard] No optimizer steps applied in iter {it} (all guarded/skipped)")
         avg_steps = float(np.mean(step_counts)) if step_counts else 0.0
 

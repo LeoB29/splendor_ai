@@ -12,8 +12,8 @@ if __name__ == "__main__":
     print("[Device] Using DirectML (AMD/Intel GPU)")
 
     # Attention-branch profiles tuned for the attention encoder.
-    # Set to one of: "stable", "progress"
-    PROFILE = "stable"
+    # Set to one of: "ramp", "stable", "progress"
+    PROFILE = "ramp"
 
     # Reset stale gate anchors to avoid inheriting weak champions.
     RESET_ANCHORS_ON_START = True
@@ -31,7 +31,58 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[Init] Could not remove {p}: {e}")
 
-    if PROFILE == "stable":
+    if PROFILE == "ramp":
+        cfg = dict(
+            iterations=30,
+            games_per_iter=48,
+            mcts_simulations=256,
+            mcts_batch=32,
+            lr=2.0e-5,
+            lr_min=1e-6,
+            device=dev,
+            replay_capacity=50000,
+            batch_size=512,
+            train_batches_per_iter=10,
+            eval_games=40,
+            resume=False,
+            resume_optimizer_state=False,
+            weight_decay=1e-4,
+            grad_clip=0.30,
+            policy_weight=1.0,
+            value_weight=1.0,
+            return_weight=0.25,
+            use_return_loss=True,
+            temp_init=1.0,
+            temp_final=0.0,
+            temp_moves=30,
+            entropy_init=0.015,
+            entropy_anneal_iters=30,
+            warmup_iters=0,
+            compile_model=False,
+            res_blocks=6,
+            width=512,
+            use_elo_ladder=True,
+            gate_pool=True,
+            gate_games=128,
+            gate_threshold=0.52,
+            gate_start_iter=6,
+            gate_revert_on_reject=False,
+            divergence_policy_loss=4.2,
+            divergence_total_loss=5.8,
+            divergence_lr_backoff=0.5,
+            divergence_min_lr=1e-6,
+            divergence_max_skips_per_iter=1,
+            divergence_rollback=True,
+            stability_ramp=True,
+            ramp_min_buffer=12000,
+            ramp_iters=8,
+            ramp_batch_frac_start=0.25,
+            ramp_divergence_policy_start=14.0,
+            ramp_divergence_total_start=18.0,
+            ramp_max_skips_start=2,
+        )
+        print("[Profile] Using ATTENTION-RAMP profile")
+    elif PROFILE == "stable":
         cfg = dict(
             iterations=30,
             games_per_iter=48,
@@ -130,7 +181,9 @@ if __name__ == "__main__":
         f"eval_games={cfg.get('eval_games')} "
         f"div_pol={cfg.get('divergence_policy_loss')} "
         f"div_tot={cfg.get('divergence_total_loss')} "
-        f"gate_start_iter={cfg.get('gate_start_iter')}"
+        f"gate_start_iter={cfg.get('gate_start_iter')} "
+        f"ramp={cfg.get('stability_ramp', False)} "
+        f"ramp_min_buffer={cfg.get('ramp_min_buffer', 0)}"
     )
 
     az_train(**cfg)
