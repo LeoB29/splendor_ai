@@ -106,6 +106,39 @@ def _model_state_dict_cpu(model: nn.Module) -> Dict[str, Any]:
     return out
 
 
+def _provisional_winner_from_state(state: GameState) -> Optional[int]:
+    max_pts = max(p.points for p in state.players)
+    candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
+    if len(candidates) == 1:
+        return candidates[0]
+    fewest_cards = min(len(state.players[i].cards) for i in candidates)
+    tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
+    return tied[0] if len(tied) == 1 else None
+
+
+def _macro_progress_signature(state: GameState) -> Tuple[Any, ...]:
+    """Signature for material progress (ignores turn and token shuffling).
+
+    This is intentionally coarse: if this signature does not change for many plies,
+    the game is in a practical deadlock even if legal token moves still exist.
+    """
+    player_sig = tuple(
+        (
+            int(p.points),
+            int(len(p.cards)),
+            int(len(p.reserved)),
+        )
+        for p in state.players
+    )
+    board_sig = tuple(
+        (int(t), int(len([c for c in cards if c is not None])))
+        for t, cards in sorted(state.board.items())
+    )
+    deck_sig = tuple((int(t), int(len(cards))) for t, cards in sorted(state.deck.items()))
+    nobles_left = int(len(state.nobles))
+    return (player_sig, board_sig, deck_sig, nobles_left)
+
+
 # -----------------------------
 # Policy + Value Network (Attention)
 # -----------------------------
@@ -1048,7 +1081,16 @@ def _load_ckpt_model(path: str, device: Any, input_size: int, action_size: int, 
     return None
 
 
-def arena_vs_model(model: PolicyValueNet, opp: PolicyValueNet, games: int = 100, sims: int = 64, device: Any = "cpu", mcts_batch: int = 16, max_moves: int = 250) -> tuple[float, float]:
+def arena_vs_model(
+    model: PolicyValueNet,
+    opp: PolicyValueNet,
+    games: int = 100,
+    sims: int = 64,
+    device: Any = "cpu",
+    mcts_batch: int = 16,
+    max_moves: int = 250,
+    no_progress_limit: int = 40,
+) -> tuple[float, float]:
     wins = 0
     margins: list[float] = []
     for g in range(games):
@@ -1057,13 +1099,32 @@ def arena_vs_model(model: PolicyValueNet, opp: PolicyValueNet, games: int = 100,
         mcts_me = AlphaZeroMCTS(model, device=device, n_simulations=sims, mcts_batch=mcts_batch)
         mcts_opp = AlphaZeroMCTS(opp, device=device, n_simulations=sims, mcts_batch=mcts_batch)
         move_count = 0
+        consecutive_passes = 0
+        ended_by_pass = False
+        ended_by_stall = False
+        progress_sig = _macro_progress_signature(state)
+        no_progress_steps = 0
         while not state.is_terminal and move_count < max_moves:
             legal = state.get_legal_actions()
             if not legal:
                 state.current_player = (state.current_player + 1) % len(state.players)
+                consecutive_passes += 1
                 # External state change without an encoded action: tree is stale.
                 mcts_me.reset_root()
                 mcts_opp.reset_root()
+                if consecutive_passes >= len(state.players):
+                    ended_by_pass = True
+                    break
+                if int(no_progress_limit) > 0:
+                    sig = _macro_progress_signature(state)
+                    if sig == progress_sig:
+                        no_progress_steps += 1
+                    else:
+                        no_progress_steps = 0
+                        progress_sig = sig
+                    if no_progress_steps >= int(no_progress_limit):
+                        ended_by_stall = True
+                        break
                 continue
             if state.current_player == my_index:
                 _, a_idx = mcts_me.run(state, temperature=0.0)
@@ -1097,10 +1158,24 @@ def arena_vs_model(model: PolicyValueNet, opp: PolicyValueNet, games: int = 100,
                 mcts_me.reset_root()
             state = state.apply_action(a)
             move_count += 1
+            consecutive_passes = 0
+            if int(no_progress_limit) > 0:
+                sig = _macro_progress_signature(state)
+                if sig == progress_sig:
+                    no_progress_steps += 1
+                else:
+                    no_progress_steps = 0
+                    progress_sig = sig
+                if no_progress_steps >= int(no_progress_limit):
+                    ended_by_stall = True
+                    break
         my_pts = state.players[my_index].points
         opp_pts = state.players[1 - my_index].points
         margins.append(my_pts - opp_pts)
-        if state.winner == my_index:
+        winner_idx = state.winner
+        if winner_idx is None and (ended_by_pass or ended_by_stall or move_count >= int(max_moves)):
+            winner_idx = _provisional_winner_from_state(state)
+        if winner_idx == my_index:
             wins += 1
     return (wins / games if games > 0 else 0.0), (float(np.mean(margins)) if margins else 0.0)
 
@@ -1121,7 +1196,8 @@ class Sample:
 def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device: str = "cpu", temperature: float = 1.0,
                       temp_init: float = 1.0, temp_final: float = 0.0, temp_moves: int = 20,
                       add_dirichlet: bool = True, mcts_batch: int = 16,
-                      policy_log_moves: int = 0, policy_log_topk: int = 3) -> Tuple[List[Sample], int]:
+                      policy_log_moves: int = 0, policy_log_topk: int = 3,
+                      max_moves: int = 250, no_progress_limit: int = 40) -> Tuple[List[Sample], int]:
     state = setup_game(num_players=2)
     mcts = AlphaZeroMCTS(model, device=device, n_simulations=mcts_simulations, mcts_batch=mcts_batch)
 
@@ -1129,8 +1205,11 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
     consecutive_passes = 0
     move_idx = 0
     ended_by_pass = False
+    ended_by_stall = False
+    progress_sig = _macro_progress_signature(state)
+    no_progress_steps = 0
 
-    while not state.is_terminal:
+    while not state.is_terminal and move_idx < int(max_moves):
         # If no legal actions, pass the turn (as in game_sim)
         legal_actions = state.get_legal_actions()
         if not legal_actions:
@@ -1142,6 +1221,16 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
             if consecutive_passes >= len(state.players):
                 ended_by_pass = True
                 break
+            if int(no_progress_limit) > 0:
+                sig = _macro_progress_signature(state)
+                if sig == progress_sig:
+                    no_progress_steps += 1
+                else:
+                    no_progress_steps = 0
+                    progress_sig = sig
+                if no_progress_steps >= int(no_progress_limit):
+                    ended_by_stall = True
+                    break
             continue
         consecutive_passes = 0
 
@@ -1188,12 +1277,34 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
                         mcts.reset_root()
                 except Exception:
                     mcts.reset_root()
+                if int(no_progress_limit) > 0:
+                    sig = _macro_progress_signature(state)
+                    if sig == progress_sig:
+                        no_progress_steps += 1
+                    else:
+                        no_progress_steps = 0
+                        progress_sig = sig
+                    if no_progress_steps >= int(no_progress_limit):
+                        ended_by_stall = True
+                        move_idx += 1
+                        break
                 move_idx += 1
                 continue
             else:
                 # Should not hit because we handled no-legal case earlier; skip turn defensively
                 state.current_player = (state.current_player + 1) % len(state.players)
                 mcts.reset_root()
+                if int(no_progress_limit) > 0:
+                    sig = _macro_progress_signature(state)
+                    if sig == progress_sig:
+                        no_progress_steps += 1
+                    else:
+                        no_progress_steps = 0
+                        progress_sig = sig
+                    if no_progress_steps >= int(no_progress_limit):
+                        ended_by_stall = True
+                        move_idx += 1
+                        break
                 move_idx += 1
                 continue
         else:
@@ -1224,20 +1335,25 @@ def self_play_episode(model: PolicyValueNet, mcts_simulations: int = 100, device
                 mcts.reuse_after_play(a_idx)
             except Exception:
                 pass
+        if int(no_progress_limit) > 0:
+            sig = _macro_progress_signature(state)
+            if sig == progress_sig:
+                no_progress_steps += 1
+            else:
+                no_progress_steps = 0
+                progress_sig = sig
+            if no_progress_steps >= int(no_progress_limit):
+                ended_by_stall = True
+                move_idx += 1
+                break
         move_idx += 1
 
     if state.winner is not None:
         winner = state.winner
-    elif ended_by_pass:
-        # Provisional winner on pass-break only: highest points, then fewest purchased cards
-        max_pts = max(p.points for p in state.players)
-        candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
-        if len(candidates) == 1:
-            winner = candidates[0]
-        else:
-            fewest_cards = min(len(state.players[i].cards) for i in candidates)
-            tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
-            winner = tied[0] if len(tied) == 1 else -1
+    elif ended_by_pass or ended_by_stall or move_idx >= int(max_moves):
+        # Provisional winner for forced exits: points, then fewest purchased cards.
+        prov = _provisional_winner_from_state(state)
+        winner = int(prov) if prov is not None else -1
     else:
         winner = -1
     return trajectory, winner
@@ -1317,6 +1433,7 @@ _EV_DEVICE: Any = "cpu"
 _EV_MCTS_SIM: int = 64
 _EV_MCTS_BATCH: int = 16
 _EV_MAX_MOVES: int = 250
+_EV_NO_PROGRESS_LIMIT: int = 40
 _EV_OPPONENT: str = "random"
 _EV_COLLECT_DIAG: bool = False
 _EV_NOLEGAL_SAMPLE_CAP: int = 2
@@ -1353,12 +1470,25 @@ def _sp_init(model_bytes: bytes, input_size: int, action_size: int, width: int, 
     _SP_MODEL = m.to(dev).eval()
 
 
-def _sp_run(args: Tuple[int, float, float, float, int, bool, int, Optional[int]]) -> Tuple[List[Sample], int]:
+def _sp_run(args: Tuple[int, float, float, float, int, bool, int, Optional[int], int, int]) -> Tuple[List[Sample], int]:
     """Run one self-play episode using the global model.
 
-    Args: (mcts_simulations, temperature, temp_init, temp_final, temp_moves, add_dirichlet, mcts_batch, seed)
+    Args:
+      (mcts_simulations, temperature, temp_init, temp_final, temp_moves,
+       add_dirichlet, mcts_batch, seed, max_moves, no_progress_limit)
     """
-    (mcts_simulations, temperature, temp_init, temp_final, temp_moves, add_dirichlet, mcts_batch, seed) = args
+    (
+        mcts_simulations,
+        temperature,
+        temp_init,
+        temp_final,
+        temp_moves,
+        add_dirichlet,
+        mcts_batch,
+        seed,
+        max_moves,
+        no_progress_limit,
+    ) = args
     if seed is not None:
         try:
             random.seed(seed)
@@ -1377,6 +1507,8 @@ def _sp_run(args: Tuple[int, float, float, float, int, bool, int, Optional[int]]
         temp_moves=temp_moves,
         add_dirichlet=add_dirichlet,
         mcts_batch=mcts_batch,
+        max_moves=max_moves,
+        no_progress_limit=no_progress_limit,
     )
 
 
@@ -1938,7 +2070,7 @@ def _snapshot_no_legal_state(state: GameState) -> Dict[str, Any]:
         "p_tokens": dict(p.tokens),
         "opp_tokens": dict(opp.tokens),
         "bonuses": dict(p.bonuses),
-        "reserved": int(len(p.reserved_cards)),
+        "reserved": int(len(p.reserved)),
         "can_reserve": bool(p.can_reserve()),
         "colors_avail": colors_avail,
         "bank_ge4": bank_ge4,
@@ -1947,17 +2079,10 @@ def _snapshot_no_legal_state(state: GameState) -> Dict[str, Any]:
     }
 
 
-def _resolve_winner_after_pass(state: GameState, ended_by_pass: bool) -> Optional[int]:
+def _resolve_winner_after_forced_end(state: GameState, forced_end: bool) -> Optional[int]:
     winner_idx = state.winner
-    if winner_idx is None and ended_by_pass:
-        max_pts = max(p.points for p in state.players)
-        candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
-        if len(candidates) == 1:
-            winner_idx = candidates[0]
-        else:
-            fewest_cards = min(len(state.players[i].cards) for i in candidates)
-            tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
-            winner_idx = tied[0] if len(tied) == 1 else None
+    if winner_idx is None and forced_end:
+        winner_idx = _provisional_winner_from_state(state)
     return winner_idx
 
 
@@ -2006,11 +2131,12 @@ def _ev_init(
     mcts_simulations: int,
     mcts_batch: int,
     max_moves: int,
+    no_progress_limit: int,
     opponent: str,
     collect_diag: bool,
     no_legal_sample_cap: int,
 ) -> None:
-    global _EV_MODEL, _EV_DEVICE, _EV_MCTS_SIM, _EV_MCTS_BATCH, _EV_MAX_MOVES, _EV_OPPONENT, _EV_COLLECT_DIAG, _EV_NOLEGAL_SAMPLE_CAP
+    global _EV_MODEL, _EV_DEVICE, _EV_MCTS_SIM, _EV_MCTS_BATCH, _EV_MAX_MOVES, _EV_NO_PROGRESS_LIMIT, _EV_OPPONENT, _EV_COLLECT_DIAG, _EV_NOLEGAL_SAMPLE_CAP
 
     dev: Any = "cpu"
     try:
@@ -2049,6 +2175,7 @@ def _ev_init(
     _EV_MCTS_SIM = int(mcts_simulations)
     _EV_MCTS_BATCH = int(max(1, mcts_batch))
     _EV_MAX_MOVES = int(max(1, max_moves))
+    _EV_NO_PROGRESS_LIMIT = int(max(1, no_progress_limit))
     _EV_OPPONENT = str(opponent)
     _EV_COLLECT_DIAG = bool(collect_diag)
     _EV_NOLEGAL_SAMPLE_CAP = int(max(0, no_legal_sample_cap))
@@ -2063,6 +2190,7 @@ def _eval_game_once(
     mcts_simulations: int,
     mcts_batch: int,
     max_moves: int,
+    no_progress_limit: int,
     device: Any,
     collect_diag: bool,
     no_legal_sample_cap: int,
@@ -2077,9 +2205,12 @@ def _eval_game_once(
     move_count = 0
     consecutive_passes = 0
     ended_by_pass = False
+    ended_by_stall = False
     no_legal_count = 0
     no_legal_samples: List[Dict[str, Any]] = []
     diag = _new_eval_policy_diag() if collect_diag else _new_eval_policy_diag()
+    progress_sig = _macro_progress_signature(state)
+    no_progress_steps = 0
 
     while (not state.is_terminal) and (move_count < int(max_moves)):
         legal = state.get_legal_actions()
@@ -2096,6 +2227,16 @@ def _eval_game_once(
             if consecutive_passes >= len(state.players):
                 ended_by_pass = True
                 break
+            if int(no_progress_limit) > 0:
+                sig = _macro_progress_signature(state)
+                if sig == progress_sig:
+                    no_progress_steps += 1
+                else:
+                    no_progress_steps = 0
+                    progress_sig = sig
+                if no_progress_steps >= int(no_progress_limit):
+                    ended_by_stall = True
+                    break
             continue
 
         played_a_idx: Optional[int] = None
@@ -2123,6 +2264,16 @@ def _eval_game_once(
         state.log_no_legal = False
         move_count += 1
         consecutive_passes = 0
+        if int(no_progress_limit) > 0:
+            sig = _macro_progress_signature(state)
+            if sig == progress_sig:
+                no_progress_steps += 1
+            else:
+                no_progress_steps = 0
+                progress_sig = sig
+            if no_progress_steps >= int(no_progress_limit):
+                ended_by_stall = True
+                break
 
         if played_a_idx is not None:
             try:
@@ -2132,7 +2283,8 @@ def _eval_game_once(
         else:
             mcts.reset_root()
 
-    winner_idx = _resolve_winner_after_pass(state, ended_by_pass)
+    forced_end = bool(ended_by_pass or ended_by_stall or (move_count >= int(max_moves) and not state.is_terminal))
+    winner_idx = _resolve_winner_after_forced_end(state, forced_end)
     my_pts = state.players[my_index].points
     opp_pts = state.players[1 - my_index].points
 
@@ -2143,6 +2295,7 @@ def _eval_game_once(
         "diag": diag if collect_diag else _new_eval_policy_diag(),
         "no_legal_count": int(no_legal_count),
         "no_legal_samples": no_legal_samples,
+        "stalled": int(ended_by_stall),
     }
 
 
@@ -2157,6 +2310,7 @@ def _ev_run(args: Tuple[int, Optional[int]]) -> Dict[str, Any]:
         mcts_simulations=int(_EV_MCTS_SIM),
         mcts_batch=int(_EV_MCTS_BATCH),
         max_moves=int(_EV_MAX_MOVES),
+        no_progress_limit=int(_EV_NO_PROGRESS_LIMIT),
         device=_EV_DEVICE,
         collect_diag=bool(_EV_COLLECT_DIAG),
         no_legal_sample_cap=int(_EV_NOLEGAL_SAMPLE_CAP),
@@ -2171,6 +2325,7 @@ def _run_eval_games(
     device: Any,
     mcts_batch: int,
     max_moves: int,
+    no_progress_limit: int,
     opponent: str,
     collect_diag: bool,
     eval_workers: int,
@@ -2187,6 +2342,7 @@ def _run_eval_games(
     diag_parts: List[Dict[str, float]] = []
     no_legal_count = 0
     no_legal_samples: List[Dict[str, Any]] = []
+    stalled_games = 0
 
     interval = max(1, games_i // 10)
     base_seed = random.randint(0, 2**31 - 1)
@@ -2232,6 +2388,7 @@ def _run_eval_games(
                     int(mcts_simulations),
                     int(max(1, mcts_batch)),
                     int(max(1, max_moves)),
+                    int(max(1, no_progress_limit)),
                     str(opponent),
                     bool(collect_diag),
                     int(sample_cap),
@@ -2244,6 +2401,7 @@ def _run_eval_games(
                     if collect_diag:
                         diag_parts.append(out.get("diag", _new_eval_policy_diag()))
                     no_legal_count += int(out.get("no_legal_count", 0))
+                    stalled_games += int(out.get("stalled", 0))
                     for snap in out.get("no_legal_samples", []):
                         if len(no_legal_samples) < sample_cap:
                             no_legal_samples.append(snap)
@@ -2263,6 +2421,7 @@ def _run_eval_games(
                 mcts_simulations=int(mcts_simulations),
                 mcts_batch=int(max(1, mcts_batch)),
                 max_moves=int(max(1, max_moves)),
+                no_progress_limit=int(max(1, no_progress_limit)),
                 device=device,
                 collect_diag=bool(collect_diag),
                 no_legal_sample_cap=int(sample_cap),
@@ -2273,6 +2432,7 @@ def _run_eval_games(
             if collect_diag:
                 diag_parts.append(out.get("diag", _new_eval_policy_diag()))
             no_legal_count += int(out.get("no_legal_count", 0))
+            stalled_games += int(out.get("stalled", 0))
             for snap in out.get("no_legal_samples", []):
                 if len(no_legal_samples) < sample_cap:
                     no_legal_samples.append(snap)
@@ -2287,6 +2447,8 @@ def _run_eval_games(
                 f"p={snap.get('p')} reserved={snap.get('reserved')} can_reserve={snap.get('can_reserve')} "
                 f"board={snap.get('board')} deck={snap.get('deck')}"
             )
+    if stalled_games > 0:
+        print(f"[{progress_tag}Deadlock] stalled_games={stalled_games}/{games_i} no_progress_limit={int(max(1, no_progress_limit))}")
 
     diag = _merge_eval_policy_diag(diag_parts) if collect_diag else _new_eval_policy_diag()
     return wins, margins, lengths, diag, no_legal_count, no_legal_samples
@@ -2299,6 +2461,7 @@ def evaluate_vs_random(
     device: str = "cpu",
     mcts_batch: int = 16,
     max_moves: int = 250,
+    no_progress_limit: int = 40,
     return_diagnostics: bool = False,
     eval_workers: int = 0,
     no_legal_sample_cap: int = 2,
@@ -2310,6 +2473,7 @@ def evaluate_vs_random(
         device=device,
         mcts_batch=int(max(1, mcts_batch)),
         max_moves=int(max(1, max_moves)),
+        no_progress_limit=int(max(1, no_progress_limit)),
         opponent="random",
         collect_diag=bool(return_diagnostics),
         eval_workers=int(eval_workers),
@@ -2387,6 +2551,7 @@ def evaluate_vs_greedy(
     device: str = "cpu",
     mcts_batch: int = 16,
     max_moves: int = 250,
+    no_progress_limit: int = 40,
     return_diagnostics: bool = False,
     eval_workers: int = 0,
     no_legal_sample_cap: int = 2,
@@ -2398,6 +2563,7 @@ def evaluate_vs_greedy(
         device=device,
         mcts_batch=int(max(1, mcts_batch)),
         max_moves=int(max(1, max_moves)),
+        no_progress_limit=int(max(1, no_progress_limit)),
         opponent="greedy",
         collect_diag=bool(return_diagnostics),
         eval_workers=int(eval_workers),
@@ -2496,6 +2662,11 @@ def az_train(
     # Parallel self-play
     selfplay_workers: int = 0,
     selfplay_device: Optional[str] = None,
+    # Episode robustness controls
+    selfplay_max_moves: int = 250,
+    no_progress_limit: int = 40,
+    # Length diagnostics
+    long_game_threshold: int = 90,
     # Eval controls
     eval_mcts_batch: Optional[int] = None,
     eval_workers: int = 0,
@@ -2507,7 +2678,7 @@ def az_train(
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
     expected_train_header = (
-        "iter,buffer,avg_steps,loss,policy_loss,value_loss,return_loss,"
+        "iter,buffer,avg_steps,p95_steps,long_game_rate,loss,policy_loss,value_loss,return_loss,"
         "win_rand,win_greedy,margin_g,len_g,"
         "diag_g_legal_n,diag_g_top1_legal,diag_g_take,diag_g_buy_vis,diag_g_buy_res,diag_g_reserve"
     )
@@ -2848,7 +3019,18 @@ def az_train(
                     # Prepare per-game args
                     base_seed = random.randint(1, 10_000_000)
                     args_list = [
-                        (mcts_simulations, 1.0, float(temp_init), float(temp_final), int(temp_moves), True, int(mcts_batch), base_seed + i)
+                        (
+                            mcts_simulations,
+                            1.0,
+                            float(temp_init),
+                            float(temp_final),
+                            int(temp_moves),
+                            True,
+                            int(mcts_batch),
+                            base_seed + i,
+                            int(max(1, selfplay_max_moves)),
+                            int(max(1, no_progress_limit)),
+                        )
                         for i in range(games_per_iter)
                     ]
                     for idx, (traj, winner) in enumerate(pool.imap_unordered(_sp_run, args_list), start=1):
@@ -2872,6 +3054,8 @@ def az_train(
                         mcts_batch=mcts_batch,
                         policy_log_moves=log_moves,
                         policy_log_topk=policy_log_topk,
+                        max_moves=int(max(1, selfplay_max_moves)),
+                        no_progress_limit=int(max(1, no_progress_limit)),
                     )
                     X, P, Z, ret_actions, ret_cands, ret_probs = compute_targets(traj, winner, color_augments=color_augments)
                     buffer.add(X, P, Z, ret_actions, ret_cands, ret_probs)
@@ -2893,6 +3077,8 @@ def az_train(
                     mcts_batch=mcts_batch,
                     policy_log_moves=log_moves,
                     policy_log_topk=policy_log_topk,
+                    max_moves=int(max(1, selfplay_max_moves)),
+                    no_progress_limit=int(max(1, no_progress_limit)),
                 )
                 X, P, Z, ret_actions, ret_cands, ret_probs = compute_targets(traj, winner, color_augments=color_augments)
                 buffer.add(X, P, Z, ret_actions, ret_cands, ret_probs)
@@ -3057,6 +3243,11 @@ def az_train(
             elif skipped_batches > 0:
                 print(f"[Guard] No optimizer steps applied in iter {it} (all guarded/skipped)")
         avg_steps = float(np.mean(step_counts)) if step_counts else 0.0
+        p95_steps = float(np.percentile(step_counts, 95)) if step_counts else 0.0
+        long_game_rate = (
+            float(np.mean(np.array(step_counts, dtype=np.float32) >= float(max(1, long_game_threshold))))
+            if step_counts else 0.0
+        )
         optimizer_steps = int(len(losses))
         if ramp_skipped_training:
             train_state = "ramp_warmup"
@@ -3087,6 +3278,7 @@ def az_train(
                 mcts_simulations=mcts_simulations,  # full sims for eval
                 device=device,
                 mcts_batch=eff_eval_batch,
+                no_progress_limit=int(max(1, no_progress_limit)),
                 return_diagnostics=True,
                 eval_workers=eval_workers,
                 no_legal_sample_cap=eval_no_legal_sample_cap,
@@ -3098,6 +3290,7 @@ def az_train(
                 mcts_simulations=mcts_simulations,  # full sims for eval
                 device=device,
                 mcts_batch=eff_eval_batch,
+                no_progress_limit=int(max(1, no_progress_limit)),
                 eval_workers=eval_workers,
                 no_legal_sample_cap=eval_no_legal_sample_cap,
             )
@@ -3109,6 +3302,7 @@ def az_train(
                 mcts_simulations=mcts_simulations,  # full sims for eval
                 device=device,
                 mcts_batch=eff_eval_batch,
+                no_progress_limit=int(max(1, no_progress_limit)),
                 return_diagnostics=True,
                 eval_workers=eval_workers,
                 no_legal_sample_cap=eval_no_legal_sample_cap,
@@ -3120,6 +3314,7 @@ def az_train(
                 mcts_simulations=mcts_simulations,  # full sims for eval
                 device=device,
                 mcts_batch=eff_eval_batch,
+                no_progress_limit=int(max(1, no_progress_limit)),
                 eval_workers=eval_workers,
                 no_legal_sample_cap=eval_no_legal_sample_cap,
             )
@@ -3176,7 +3371,15 @@ def az_train(
                                 opp_model = _load_ckpt_model(opp_path, device, input_size, action_size, width=width, res_blocks=res_blocks)
                                 if opp_model is None:
                                     continue
-                                wr, _margin = arena_vs_model(model, opp_model, games=int(ladder_games), sims=int(ladder_sims), device=device, mcts_batch=mcts_batch)
+                                wr, _margin = arena_vs_model(
+                                    model,
+                                    opp_model,
+                                    games=int(ladder_games),
+                                    sims=int(ladder_sims),
+                                    device=device,
+                                    mcts_batch=mcts_batch,
+                                    no_progress_limit=int(max(1, no_progress_limit)),
+                                )
                                 expected = 1.0 / (1.0 + 10 ** ((opp_elo - cand_elo) / 400.0))
                                 cand_elo_before = cand_elo
                                 opp_elo_before = opp_elo
@@ -3217,7 +3420,15 @@ def az_train(
                     input_size2 = len(flatten_game_state(dummy_state))
                     opp_model = _load_ckpt_model(champ_path, device, input_size2, action_size, width=width, res_blocks=res_blocks)
                     if opp_model is not None:
-                        wr, margin = arena_vs_model(model, opp_model, games=gate_games, sims=max(16, mcts_simulations // 2), device=device, mcts_batch=mcts_batch)
+                        wr, margin = arena_vs_model(
+                            model,
+                            opp_model,
+                            games=gate_games,
+                            sims=max(16, mcts_simulations // 2),
+                            device=device,
+                            mcts_batch=mcts_batch,
+                            no_progress_limit=int(max(1, no_progress_limit)),
+                        )
                         print(f"[Gate] vs champion: win%={wr:.1%} margin={margin:.2f}")
                         # Log gating result
                         try:
@@ -3257,13 +3468,13 @@ def az_train(
             writer = csv.writer(f)
             if write_header:
                 writer.writerow([
-                    "iter", "buffer", "avg_steps", "loss", "policy_loss", "value_loss", "return_loss",
+                    "iter", "buffer", "avg_steps", "p95_steps", "long_game_rate", "loss", "policy_loss", "value_loss", "return_loss",
                     "win_rand", "win_greedy", "margin_g", "len_g",
                     "diag_g_legal_n", "diag_g_top1_legal", "diag_g_take", "diag_g_buy_vis", "diag_g_buy_res", "diag_g_reserve",
                 ])
                 write_header = False
             writer.writerow([
-                it, buffer.size(), f"{avg_steps:.2f}", f"{avg_loss:.4f}", f"{avg_pl:.4f}", f"{avg_vl:.4f}", f"{avg_rl:.4f}",
+                it, buffer.size(), f"{avg_steps:.2f}", f"{p95_steps:.2f}", f"{long_game_rate:.3f}", f"{avg_loss:.4f}", f"{avg_pl:.4f}", f"{avg_vl:.4f}", f"{avg_rl:.4f}",
                 f"{win_rate:.3f}", f"{win_g:.3f}", f"{margin_g:.3f}", f"{len_g:.2f}",
                 f"{diag_g.get('legal_count_mean', 0.0):.2f}",
                 f"{diag_g.get('top1_legal_mean', 0.0):.3f}",
@@ -3274,7 +3485,7 @@ def az_train(
             ])
 
         print(
-            f"Iter {it:02d} | buffer={buffer.size()} steps={avg_steps:.1f} "
+            f"Iter {it:02d} | buffer={buffer.size()} steps={avg_steps:.1f} p95={p95_steps:.1f} long={long_game_rate:.1%} "
             f"loss={avg_loss:.4f} pol={avg_pl:.4f} val={avg_vl:.4f} ret={avg_rl:.4f} "
             f"win%_rand={win_rate:.1%} win%_greedy={win_g:.1%} margin_g={margin_g:.2f} len_g={len_g:.1f} "
             f"diag_g(legal={diag_g.get('legal_count_mean', 0.0):.1f}, top1={diag_g.get('top1_legal_mean', 0.0):.2f}, "
@@ -3310,6 +3521,7 @@ def az_train(
                     mcts_simulations=mcts_simulations,
                     device=device,
                     mcts_batch=eff_eval_batch,
+                    no_progress_limit=int(max(1, no_progress_limit)),
                     eval_workers=eval_workers,
                     no_legal_sample_cap=eval_no_legal_sample_cap,
                 )
@@ -3319,6 +3531,7 @@ def az_train(
                     mcts_simulations=mcts_simulations,
                     device=device,
                     mcts_batch=eff_eval_batch,
+                    no_progress_limit=int(max(1, no_progress_limit)),
                     eval_workers=eval_workers,
                     no_legal_sample_cap=eval_no_legal_sample_cap,
                 )

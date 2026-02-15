@@ -60,6 +60,7 @@ def _run_repo_eval(
     eval_mcts_batch: Optional[int],
     eval_workers: int,
     no_legal_sample_cap: int,
+    no_progress_limit: int,
     max_moves: int,
     device: str,
 ) -> Dict[str, Any]:
@@ -74,6 +75,7 @@ def _run_repo_eval(
         "eval_mcts_batch": int(eff_eval_batch),
         "eval_workers": int(eval_workers),
         "no_legal_sample_cap": int(no_legal_sample_cap),
+        "no_progress_limit": int(no_progress_limit),
         "max_moves": int(max_moves),
         "device": str(device),
     }
@@ -177,6 +179,7 @@ for s in seeds:
         device=dev,
         mcts_batch=int(cfg["eval_mcts_batch"]),
         max_moves=int(cfg["max_moves"]),
+        no_progress_limit=int(cfg["no_progress_limit"]),
         eval_workers=int(cfg["eval_workers"]),
         no_legal_sample_cap=int(cfg["no_legal_sample_cap"]),
     ))
@@ -192,6 +195,7 @@ for s in seeds:
         device=dev,
         mcts_batch=int(cfg["eval_mcts_batch"]),
         max_moves=int(cfg["max_moves"]),
+        no_progress_limit=int(cfg["no_progress_limit"]),
         eval_workers=int(cfg["eval_workers"]),
         no_legal_sample_cap=int(cfg["no_legal_sample_cap"]),
     )
@@ -219,6 +223,7 @@ arr_lg = np.array([m["len_g"] for m in metrics], dtype=np.float64)
         "mcts_batch": int(cfg["mcts_batch"]),
         "eval_mcts_batch": int(cfg["eval_mcts_batch"]),
         "eval_workers": int(cfg["eval_workers"]),
+        "no_progress_limit": int(cfg["no_progress_limit"]),
         "device": str(dev),
         "win_rand_mean": float(arr_wr_r.mean()) if len(arr_wr_r) else 0.0,
     "win_rand_std": float(arr_wr_r.std()) if len(arr_wr_r) else 0.0,
@@ -262,6 +267,7 @@ def main() -> None:
     ap.add_argument("--eval-mcts-batch", type=int, default=None)
     ap.add_argument("--eval-workers", type=int, default=0)
     ap.add_argument("--no-legal-sample-cap", type=int, default=1)
+    ap.add_argument("--no-progress-limit", type=int, default=40)
     ap.add_argument("--max-moves", type=int, default=250)
     ap.add_argument("--device", type=str, default="cpu", help="cpu | cuda | dml_device_string")
     ap.add_argument("--out", type=Path, default=None)
@@ -297,6 +303,7 @@ def main() -> None:
         eval_mcts_batch=args.eval_mcts_batch,
         eval_workers=args.eval_workers,
         no_legal_sample_cap=args.no_legal_sample_cap,
+        no_progress_limit=args.no_progress_limit,
         max_moves=args.max_moves,
         device=args.device,
     )
@@ -312,6 +319,7 @@ def main() -> None:
         eval_mcts_batch=args.eval_mcts_batch,
         eval_workers=args.eval_workers,
         no_legal_sample_cap=args.no_legal_sample_cap,
+        no_progress_limit=args.no_progress_limit,
         max_moves=args.max_moves,
         device=args.device,
     )
@@ -339,6 +347,7 @@ def main() -> None:
             "eval_mcts_batch": args.eval_mcts_batch if args.eval_mcts_batch is not None else args.mcts_batch,
             "eval_workers": args.eval_workers,
             "no_legal_sample_cap": args.no_legal_sample_cap,
+            "no_progress_limit": args.no_progress_limit,
             "max_moves": args.max_moves,
             "device": args.device,
         },
@@ -377,5 +386,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

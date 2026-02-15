@@ -40,6 +40,9 @@ if __name__ == "__main__":
             eval_mcts_batch=64,
             eval_workers=4,
             eval_no_legal_sample_cap=2,
+            selfplay_max_moves=250,
+            no_progress_limit=40,
+            long_game_threshold=90,
             lr=1.0e-5,
             lr_min=1e-6,
             device=dev,
@@ -94,6 +97,9 @@ if __name__ == "__main__":
             eval_mcts_batch=64,
             eval_workers=4,
             eval_no_legal_sample_cap=2,
+            selfplay_max_moves=250,
+            no_progress_limit=40,
+            long_game_threshold=90,
             lr=2.5e-5,
             lr_min=1e-6,
             device=dev,
@@ -141,6 +147,9 @@ if __name__ == "__main__":
             eval_mcts_batch=64,
             eval_workers=4,
             eval_no_legal_sample_cap=2,
+            selfplay_max_moves=250,
+            no_progress_limit=40,
+            long_game_threshold=90,
             lr=4.0e-5,
             lr_min=1e-6,
             device=dev,
@@ -190,6 +199,8 @@ if __name__ == "__main__":
         f"eval_games={cfg.get('eval_games')} "
         f"eval_mcts_batch={cfg.get('eval_mcts_batch', cfg.get('mcts_batch'))} "
         f"eval_workers={cfg.get('eval_workers', 0)} "
+        f"no_progress_limit={cfg.get('no_progress_limit', 40)} "
+        f"long_thr={cfg.get('long_game_threshold', 90)} "
         f"div_pol={cfg.get('divergence_policy_loss')} "
         f"div_tot={cfg.get('divergence_total_loss')} "
         f"gate_start_iter={cfg.get('gate_start_iter')} "
