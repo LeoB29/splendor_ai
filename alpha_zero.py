@@ -35,6 +35,7 @@ from nn_input_output import (
     legal_actions_mask,
     index_to_action,
     flatten_visible_cards,
+    flatten_visible_cards_fixed,
     permute_colors_in_flat_state,
     permute_policy_colors,
     permute_action_index,
@@ -466,7 +467,7 @@ def log_policy_alignment(model: PolicyValueNet, state: GameState, device: Any = 
         if was_training:
             model.train()
 
-    vis = flatten_visible_cards(state)
+    vis_fixed = flatten_visible_cards_fixed(state)
     reserved = list(getattr(state.players[state.current_player], "reserved", []))
 
     print("[PolicyDebug] top token actions")
@@ -476,12 +477,20 @@ def log_policy_alignment(model: PolicyValueNet, state: GameState, device: Any = 
         print(f"  a={idx:02d} logit={val:+.3f}")
 
     print("[PolicyDebug] top buy-visible")
-    buy_vis = sorted([(15 + i, l[15 + i], vis[i]) for i in range(len(vis))], key=lambda t: t[1], reverse=True)
+    buy_vis = sorted(
+        [(15 + i, l[15 + i], vis_fixed[i]) for i in range(len(vis_fixed)) if vis_fixed[i] is not None],
+        key=lambda t: t[1],
+        reverse=True,
+    )
     for idx, val, card in buy_vis[: max(1, int(top_k))]:
         print(f"  a={idx:02d} logit={val:+.3f} card={_card_short(card)}")
 
     print("[PolicyDebug] top reserve-visible")
-    res_vis = sorted([(30 + i, l[30 + i], vis[i]) for i in range(len(vis))], key=lambda t: t[1], reverse=True)
+    res_vis = sorted(
+        [(30 + i, l[30 + i], vis_fixed[i]) for i in range(len(vis_fixed)) if vis_fixed[i] is not None],
+        key=lambda t: t[1],
+        reverse=True,
+    )
     for idx, val, card in res_vis[: max(1, int(top_k))]:
         print(f"  a={idx:02d} logit={val:+.3f} card={_card_short(card)}")
 
@@ -1616,6 +1625,144 @@ class ReplayBuffer:
         ret_probs = [self.ret_probs[i] for i in idxs]
         return X, P, Z, ret_actions, ret_cands, ret_probs
 
+    def to_checkpoint(self) -> Dict[str, Any]:
+        """Serialize replay samples into a tensor-only payload for safe torch.load."""
+        n = self.size()
+        payload: Dict[str, Any] = {
+            "capacity": int(self.capacity),
+            "size": int(n),
+        }
+        if n == 0:
+            return payload
+
+        states = np.stack(self.states).astype(np.float32, copy=False)
+        pis = np.stack(self.pis).astype(np.float32, copy=False)
+        zs = np.asarray(self.zs, dtype=np.float32)
+        ret_actions = np.asarray(self.ret_actions, dtype=np.int64)
+
+        ret_lens = np.zeros((n,), dtype=np.int64)
+        max_ret_len = 0
+        for i, cand in enumerate(self.ret_cands):
+            if cand is None:
+                continue
+            clen = int(len(cand))
+            ret_lens[i] = clen
+            if clen > max_ret_len:
+                max_ret_len = clen
+
+        ret_cands = np.full((n, max_ret_len), -1, dtype=np.int64)
+        ret_probs = np.zeros((n, max_ret_len), dtype=np.float32)
+        if max_ret_len > 0:
+            for i in range(n):
+                clen = int(ret_lens[i])
+                if clen <= 0:
+                    continue
+                c_arr = np.asarray(self.ret_cands[i], dtype=np.int64).reshape(-1) if self.ret_cands[i] is not None else np.empty((0,), dtype=np.int64)
+                p_arr = np.asarray(self.ret_probs[i], dtype=np.float32).reshape(-1) if self.ret_probs[i] is not None else np.empty((0,), dtype=np.float32)
+                k = min(clen, c_arr.shape[0], p_arr.shape[0] if p_arr.shape[0] > 0 else clen)
+                if k <= 0:
+                    ret_lens[i] = 0
+                    continue
+                ret_lens[i] = k
+                ret_cands[i, :k] = c_arr[:k]
+                if p_arr.shape[0] > 0:
+                    ret_probs[i, :k] = p_arr[:k]
+
+        payload.update(
+            {
+                "states": torch.from_numpy(states),
+                "pis": torch.from_numpy(pis),
+                "zs": torch.from_numpy(zs),
+                "ret_actions": torch.from_numpy(ret_actions),
+                "ret_lens": torch.from_numpy(ret_lens),
+                "ret_cands": torch.from_numpy(ret_cands),
+                "ret_probs": torch.from_numpy(ret_probs),
+            }
+        )
+        return payload
+
+    def load_checkpoint(self, payload: Dict[str, Any]) -> int:
+        """Restore replay samples from a tensor/list payload. Returns loaded sample count."""
+        def _to_np(x: Any, dtype: Optional[np.dtype] = None) -> Optional[np.ndarray]:
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                arr = x.detach().cpu().numpy()
+            else:
+                arr = np.asarray(x)
+            if dtype is not None:
+                arr = arr.astype(dtype, copy=False)
+            return arr
+
+        if not isinstance(payload, dict):
+            return 0
+
+        self.capacity = int(payload.get("capacity", self.capacity))
+        self.states = []
+        self.pis = []
+        self.zs = []
+        self.ret_actions = []
+        self.ret_cands = []
+        self.ret_probs = []
+
+        states = _to_np(payload.get("states"), np.float32)
+        pis = _to_np(payload.get("pis"), np.float32)
+        zs = _to_np(payload.get("zs"), np.float32)
+        if states is None or pis is None or zs is None:
+            return 0
+
+        if states.ndim == 0 or pis.ndim == 0 or zs.ndim == 0:
+            return 0
+
+        reported_n = int(payload.get("size", states.shape[0]))
+        n = min(reported_n, int(states.shape[0]), int(pis.shape[0]), int(zs.shape[0]))
+        if n <= 0:
+            return 0
+
+        ret_actions = _to_np(payload.get("ret_actions"), np.int64)
+        if ret_actions is None or ret_actions.ndim == 0:
+            ret_actions = np.full((n,), -1, dtype=np.int64)
+        if ret_actions.shape[0] < n:
+            pad = np.full((n - ret_actions.shape[0],), -1, dtype=np.int64)
+            ret_actions = np.concatenate([ret_actions, pad], axis=0)
+
+        ret_lens = _to_np(payload.get("ret_lens"), np.int64)
+        ret_cands = _to_np(payload.get("ret_cands"), np.int64)
+        ret_probs = _to_np(payload.get("ret_probs"), np.float32)
+        if ret_lens is None or ret_lens.ndim == 0:
+            if ret_cands is not None and ret_cands.ndim == 2:
+                ret_lens = np.full((n,), int(ret_cands.shape[1]), dtype=np.int64)
+            else:
+                ret_lens = np.zeros((n,), dtype=np.int64)
+        if ret_lens.shape[0] < n:
+            ret_lens = np.pad(ret_lens, (0, n - ret_lens.shape[0]), mode="constant", constant_values=0)
+
+        start = max(0, n - int(self.capacity))
+        for i in range(start, n):
+            self.states.append(np.asarray(states[i], dtype=np.float32).copy())
+            self.pis.append(np.asarray(pis[i], dtype=np.float32).copy())
+            self.zs.append(float(zs[i]))
+            self.ret_actions.append(int(ret_actions[i]))
+
+            k = int(max(0, ret_lens[i]))
+            if (
+                k > 0
+                and ret_cands is not None
+                and ret_probs is not None
+                and ret_cands.ndim == 2
+                and ret_probs.ndim == 2
+                and i < ret_cands.shape[0]
+                and i < ret_probs.shape[0]
+            ):
+                k = min(k, ret_cands.shape[1], ret_probs.shape[1])
+                self.ret_cands.append(np.asarray(ret_cands[i, :k], dtype=np.int64).copy())
+                self.ret_probs.append(np.asarray(ret_probs[i, :k], dtype=np.float32).copy())
+            else:
+                self.ret_cands.append(None)
+                self.ret_probs.append(None)
+
+        return self.size()
+
 
 def _find_latest_checkpoint(ckpt_dir: str) -> Optional[Tuple[str, int]]:
     try:
@@ -2197,6 +2344,8 @@ def az_train(
         scaler = None
     buffer = ReplayBuffer(capacity=replay_capacity)
     start_iter_global = 0
+    resume_replay_loaded = -1
+    resume_replay_source = ""
 
     # Resume from checkpoint if available/requested
     def _load_checkpoint_cpu_safe(path: str):
@@ -2231,6 +2380,33 @@ def az_train(
             print(f"[Resume] Failed to load model-only checkpoint {path}: {e}")
             return False
 
+    def _restore_replay_buffer(ck: Dict[str, Any], source: str) -> None:
+        nonlocal resume_replay_loaded, resume_replay_source
+        try:
+            replay_payload = ck.get("replay")
+            if replay_payload is None:
+                # Backward-compatible alias if introduced by older patches.
+                replay_payload = ck.get("replay_buffer")
+            if isinstance(replay_payload, dict):
+                restored_n = buffer.load_checkpoint(replay_payload)
+                resume_replay_loaded = int(restored_n)
+                resume_replay_source = str(source)
+                print(
+                    f"[Resume] Restored replay buffer from {source}: "
+                    f"{restored_n} samples (capacity={buffer.capacity})"
+                )
+                return
+            reported_size = int(ck.get("buffer_size", 0))
+            if reported_size > 0:
+                resume_replay_loaded = 0
+                resume_replay_source = str(source)
+                print(
+                    f"[Resume] {source} reports buffer_size={reported_size}, "
+                    "but no replay payload was found (legacy checkpoint)."
+                )
+        except Exception as e:
+            print(f"[Resume] Failed to restore replay buffer from {source}: {e}")
+
     if resume or resume_path:
         loaded = False
         if resume_path is not None and os.path.exists(resume_path):
@@ -2260,6 +2436,7 @@ def az_train(
                     except Exception:
                         pass
                 start_iter_global = int(ck.get("iter", 0))
+                _restore_replay_buffer(ck, str(resume_path))
                 if resume_optimizer_state and ("optimizer" in ck):
                     print(f"[Resume] Loaded checkpoint {resume_path} @ iter {start_iter_global} (optimizer restored)")
                 else:
@@ -2301,6 +2478,7 @@ def az_train(
                         except Exception:
                             pass
                     start_iter_global = int(ck.get("iter", itnum))
+                    _restore_replay_buffer(ck, path)
                     if resume_optimizer_state and ("optimizer" in ck):
                         print(f"[Resume] Loaded latest checkpoint {path} @ iter {start_iter_global} (optimizer restored)")
                     else:
@@ -2576,6 +2754,24 @@ def az_train(
             elif skipped_batches > 0:
                 print(f"[Guard] No optimizer steps applied in iter {it} (all guarded/skipped)")
         avg_steps = float(np.mean(step_counts)) if step_counts else 0.0
+        optimizer_steps = int(len(losses))
+        if ramp_skipped_training:
+            train_state = "ramp_warmup"
+        elif optimizer_steps == 0 and skipped_batches > 0:
+            train_state = "guarded"
+        elif optimizer_steps > 0:
+            train_state = "active"
+        else:
+            train_state = "idle"
+        if resume_replay_loaded >= 0:
+            replay_state = f"{resume_replay_loaded}@{os.path.basename(resume_replay_source)}"
+        else:
+            replay_state = "none"
+        print(
+            f"[Heartbeat] iter={it} train_state={train_state} "
+            f"opt_steps={optimizer_steps}/{eff_train_batches} skipped={skipped_batches} "
+            f"ramp_skip={int(ramp_skipped_training)} buffer={buffer.size()} replay_resume={replay_state}"
+        )
 
         # Evaluate vs random (and greedy for extra signal)
         print(f"[Iter {it}] Eval: {eval_games} games vs random")
@@ -2620,11 +2816,13 @@ def az_train(
         ckpt_path = os.path.join(ckpt_dir, f"az_iter_{it}.pt")
         ckpt_model_path = os.path.join(ckpt_dir, f"az_iter_{it}_model.pt")
         model_sd_cpu = _model_state_dict_cpu(model)
+        replay_payload = buffer.to_checkpoint()
         torch.save({
             "model": model_sd_cpu,
             "optimizer": optimizer.state_dict(),
             "iter": it,
             "buffer_size": buffer.size(),
+            "replay": replay_payload,
         }, ckpt_path)
         torch.save({
             "model": model_sd_cpu,
