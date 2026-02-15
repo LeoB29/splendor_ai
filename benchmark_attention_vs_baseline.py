@@ -57,9 +57,13 @@ def _run_repo_eval(
     games_greedy: int,
     mcts_simulations: int,
     mcts_batch: int,
+    eval_mcts_batch: Optional[int],
+    eval_workers: int,
+    no_legal_sample_cap: int,
     max_moves: int,
     device: str,
 ) -> Dict[str, Any]:
+    eff_eval_batch = int(eval_mcts_batch) if eval_mcts_batch is not None else int(mcts_batch)
     payload = {
         "ckpt": str(ckpt_path),
         "seeds": seeds,
@@ -67,6 +71,9 @@ def _run_repo_eval(
         "games_greedy": int(games_greedy),
         "mcts_simulations": int(mcts_simulations),
         "mcts_batch": int(mcts_batch),
+        "eval_mcts_batch": int(eff_eval_batch),
+        "eval_workers": int(eval_workers),
+        "no_legal_sample_cap": int(no_legal_sample_cap),
         "max_moves": int(max_moves),
         "device": str(device),
     }
@@ -168,8 +175,10 @@ for s in seeds:
         games=int(cfg["games_random"]),
         mcts_simulations=int(cfg["mcts_simulations"]),
         device=dev,
-        mcts_batch=int(cfg["mcts_batch"]),
+        mcts_batch=int(cfg["eval_mcts_batch"]),
         max_moves=int(cfg["max_moves"]),
+        eval_workers=int(cfg["eval_workers"]),
+        no_legal_sample_cap=int(cfg["no_legal_sample_cap"]),
     ))
 
     s2 = s + 10_000
@@ -181,8 +190,10 @@ for s in seeds:
         games=int(cfg["games_greedy"]),
         mcts_simulations=int(cfg["mcts_simulations"]),
         device=dev,
-        mcts_batch=int(cfg["mcts_batch"]),
+        mcts_batch=int(cfg["eval_mcts_batch"]),
         max_moves=int(cfg["max_moves"]),
+        eval_workers=int(cfg["eval_workers"]),
+        no_legal_sample_cap=int(cfg["no_legal_sample_cap"]),
     )
     metrics.append({
         "seed": int(s),
@@ -197,17 +208,19 @@ arr_wr_g = np.array([m["win_greedy"] for m in metrics], dtype=np.float64)
 arr_mg = np.array([m["margin_g"] for m in metrics], dtype=np.float64)
 arr_lg = np.array([m["len_g"] for m in metrics], dtype=np.float64)
 
-result = {
-    "checkpoint": cfg["ckpt"],
-    "width": int(width),
-    "res_blocks": int(n_blocks),
+    result = {
+        "checkpoint": cfg["ckpt"],
+        "width": int(width),
+        "res_blocks": int(n_blocks),
     "seeds": seeds,
     "games_random": int(cfg["games_random"]),
-    "games_greedy": int(cfg["games_greedy"]),
-    "mcts_simulations": int(cfg["mcts_simulations"]),
-    "mcts_batch": int(cfg["mcts_batch"]),
-    "device": str(dev),
-    "win_rand_mean": float(arr_wr_r.mean()) if len(arr_wr_r) else 0.0,
+        "games_greedy": int(cfg["games_greedy"]),
+        "mcts_simulations": int(cfg["mcts_simulations"]),
+        "mcts_batch": int(cfg["mcts_batch"]),
+        "eval_mcts_batch": int(cfg["eval_mcts_batch"]),
+        "eval_workers": int(cfg["eval_workers"]),
+        "device": str(dev),
+        "win_rand_mean": float(arr_wr_r.mean()) if len(arr_wr_r) else 0.0,
     "win_rand_std": float(arr_wr_r.std()) if len(arr_wr_r) else 0.0,
     "win_greedy_mean": float(arr_wr_g.mean()) if len(arr_wr_g) else 0.0,
     "win_greedy_std": float(arr_wr_g.std()) if len(arr_wr_g) else 0.0,
@@ -246,6 +259,9 @@ def main() -> None:
     ap.add_argument("--games-greedy", type=int, default=20)
     ap.add_argument("--mcts-simulations", type=int, default=128)
     ap.add_argument("--mcts-batch", type=int, default=16)
+    ap.add_argument("--eval-mcts-batch", type=int, default=None)
+    ap.add_argument("--eval-workers", type=int, default=0)
+    ap.add_argument("--no-legal-sample-cap", type=int, default=1)
     ap.add_argument("--max-moves", type=int, default=250)
     ap.add_argument("--device", type=str, default="cpu", help="cpu | cuda | dml_device_string")
     ap.add_argument("--out", type=Path, default=None)
@@ -278,6 +294,9 @@ def main() -> None:
         games_greedy=args.games_greedy,
         mcts_simulations=args.mcts_simulations,
         mcts_batch=args.mcts_batch,
+        eval_mcts_batch=args.eval_mcts_batch,
+        eval_workers=args.eval_workers,
+        no_legal_sample_cap=args.no_legal_sample_cap,
         max_moves=args.max_moves,
         device=args.device,
     )
@@ -290,6 +309,9 @@ def main() -> None:
         games_greedy=args.games_greedy,
         mcts_simulations=args.mcts_simulations,
         mcts_batch=args.mcts_batch,
+        eval_mcts_batch=args.eval_mcts_batch,
+        eval_workers=args.eval_workers,
+        no_legal_sample_cap=args.no_legal_sample_cap,
         max_moves=args.max_moves,
         device=args.device,
     )
@@ -314,6 +336,9 @@ def main() -> None:
             "games_greedy": args.games_greedy,
             "mcts_simulations": args.mcts_simulations,
             "mcts_batch": args.mcts_batch,
+            "eval_mcts_batch": args.eval_mcts_batch if args.eval_mcts_batch is not None else args.mcts_batch,
+            "eval_workers": args.eval_workers,
+            "no_legal_sample_cap": args.no_legal_sample_cap,
             "max_moves": args.max_moves,
             "device": args.device,
         },
@@ -352,6 +377,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 

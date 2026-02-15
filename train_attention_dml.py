@@ -37,7 +37,10 @@ if __name__ == "__main__":
             games_per_iter=48,
             mcts_simulations=256,
             mcts_batch=32,
-            lr=2.0e-5,
+            eval_mcts_batch=64,
+            eval_workers=4,
+            eval_no_legal_sample_cap=2,
+            lr=1.0e-5,
             lr_min=1e-6,
             device=dev,
             replay_capacity=50000,
@@ -47,7 +50,7 @@ if __name__ == "__main__":
             resume=False,
             resume_optimizer_state=False,
             weight_decay=1e-4,
-            grad_clip=0.30,
+            grad_clip=0.20,
             policy_weight=1.0,
             value_weight=1.0,
             return_weight=0.25,
@@ -74,12 +77,12 @@ if __name__ == "__main__":
             divergence_max_skips_per_iter=1,
             divergence_rollback=True,
             stability_ramp=True,
-            ramp_min_buffer=12000,
-            ramp_iters=8,
-            ramp_batch_frac_start=0.25,
-            ramp_divergence_policy_start=14.0,
-            ramp_divergence_total_start=18.0,
-            ramp_max_skips_start=2,
+            ramp_min_buffer=20000,
+            ramp_iters=12,
+            ramp_batch_frac_start=0.10,
+            ramp_divergence_policy_start=8.0,
+            ramp_divergence_total_start=10.5,
+            ramp_max_skips_start=1,
         )
         print("[Profile] Using ATTENTION-RAMP profile")
     elif PROFILE == "stable":
@@ -88,6 +91,9 @@ if __name__ == "__main__":
             games_per_iter=48,
             mcts_simulations=256,
             mcts_batch=32,
+            eval_mcts_batch=64,
+            eval_workers=4,
+            eval_no_legal_sample_cap=2,
             lr=2.5e-5,
             lr_min=1e-6,
             device=dev,
@@ -132,6 +138,9 @@ if __name__ == "__main__":
             games_per_iter=48,
             mcts_simulations=256,
             mcts_batch=32,
+            eval_mcts_batch=64,
+            eval_workers=4,
+            eval_no_legal_sample_cap=2,
             lr=4.0e-5,
             lr_min=1e-6,
             device=dev,
@@ -179,6 +188,8 @@ if __name__ == "__main__":
         f"lr_min={cfg.get('lr_min'):.2e} "
         f"batches={cfg.get('train_batches_per_iter')} "
         f"eval_games={cfg.get('eval_games')} "
+        f"eval_mcts_batch={cfg.get('eval_mcts_batch', cfg.get('mcts_batch'))} "
+        f"eval_workers={cfg.get('eval_workers', 0)} "
         f"div_pol={cfg.get('divergence_policy_loss')} "
         f"div_tot={cfg.get('divergence_total_loss')} "
         f"gate_start_iter={cfg.get('gate_start_iter')} "

@@ -1312,6 +1312,14 @@ def compute_targets(
 # -----------------------------
 _SP_MODEL: Optional[PolicyValueNet] = None
 _SP_DEVICE: Any = "cpu"
+_EV_MODEL: Optional[PolicyValueNet] = None
+_EV_DEVICE: Any = "cpu"
+_EV_MCTS_SIM: int = 64
+_EV_MCTS_BATCH: int = 16
+_EV_MAX_MOVES: int = 250
+_EV_OPPONENT: str = "random"
+_EV_COLLECT_DIAG: bool = False
+_EV_NOLEGAL_SAMPLE_CAP: int = 2
 
 
 def _sp_init(model_bytes: bytes, input_size: int, action_size: int, width: int, res_blocks: int, device_str: str) -> None:
@@ -1370,6 +1378,17 @@ def _sp_run(args: Tuple[int, float, float, float, int, bool, int, Optional[int]]
         add_dirichlet=add_dirichlet,
         mcts_batch=mcts_batch,
     )
+
+
+def _set_all_seeds(seed: Optional[int]) -> None:
+    if seed is None:
+        return
+    try:
+        random.seed(int(seed))
+        np.random.seed(int(seed) % (2**32 - 1))
+        torch.manual_seed(int(seed))
+    except Exception:
+        pass
 
 
 def train_on_batch(
@@ -1887,6 +1906,392 @@ def _finalize_eval_policy_diag(diag: Dict[str, float]) -> Dict[str, float]:
     }
 
 
+def _merge_eval_policy_diag(diags: List[Dict[str, float]]) -> Dict[str, float]:
+    out = _new_eval_policy_diag()
+    for d in diags:
+        if not isinstance(d, dict):
+            continue
+        for k in out.keys():
+            out[k] += float(d.get(k, 0.0))
+    return out
+
+
+def _snapshot_no_legal_state(state: GameState) -> Dict[str, Any]:
+    p_idx = int(state.current_player)
+    n_players = max(1, len(state.players))
+    opp_idx = (p_idx + 1) % n_players
+    p = state.players[p_idx]
+    opp = state.players[opp_idx]
+
+    board_counts = {
+        int(t): int(len([c for c in cards if c is not None]))
+        for t, cards in state.board.items()
+    }
+    deck_counts = {int(t): int(len(cards)) for t, cards in state.deck.items()}
+
+    colors_avail = sorted([c for c, k in state.tokens.items() if c != "gold" and int(k) > 0])
+    bank_ge4 = sorted([c for c, k in state.tokens.items() if c != "gold" and int(k) >= 4])
+
+    return {
+        "p": p_idx,
+        "bank": dict(state.tokens),
+        "p_tokens": dict(p.tokens),
+        "opp_tokens": dict(opp.tokens),
+        "bonuses": dict(p.bonuses),
+        "reserved": int(len(p.reserved_cards)),
+        "can_reserve": bool(p.can_reserve()),
+        "colors_avail": colors_avail,
+        "bank_ge4": bank_ge4,
+        "board": board_counts,
+        "deck": deck_counts,
+    }
+
+
+def _resolve_winner_after_pass(state: GameState, ended_by_pass: bool) -> Optional[int]:
+    winner_idx = state.winner
+    if winner_idx is None and ended_by_pass:
+        max_pts = max(p.points for p in state.players)
+        candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
+        if len(candidates) == 1:
+            winner_idx = candidates[0]
+        else:
+            fewest_cards = min(len(state.players[i].cards) for i in candidates)
+            tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
+            winner_idx = tied[0] if len(tied) == 1 else None
+    return winner_idx
+
+
+def _infer_model_arch_from_state_dict(
+    state_dict: Dict[str, Any],
+    fallback_width: int,
+    fallback_blocks: int,
+) -> Tuple[int, int]:
+    width = int(max(1, fallback_width))
+    n_blocks = int(max(1, fallback_blocks))
+
+    keys = list(state_dict.keys())
+    has_orig_mod_prefix = any(isinstance(k, str) and k.startswith("_orig_mod.") for k in keys)
+    prefix = "_orig_mod." if has_orig_mod_prefix else ""
+
+    cls_key = f"{prefix}cls_token"
+    cls_tok = state_dict.get(cls_key)
+    if isinstance(cls_tok, torch.Tensor) and cls_tok.ndim >= 3:
+        width = int(cls_tok.shape[-1])
+
+    block_ids: set[int] = set()
+    for k in keys:
+        if not isinstance(k, str):
+            continue
+        if not k.startswith(f"{prefix}blocks."):
+            continue
+        parts = k.split(".")
+        if len(parts) < 3:
+            continue
+        block_part_idx = 2 if has_orig_mod_prefix else 1
+        if block_part_idx < len(parts) and parts[block_part_idx].isdigit():
+            block_ids.add(int(parts[block_part_idx]))
+    if block_ids:
+        n_blocks = max(1, max(block_ids) + 1)
+
+    return int(width), int(n_blocks)
+
+
+def _ev_init(
+    model_bytes: bytes,
+    input_size: int,
+    action_size: int,
+    width: int,
+    res_blocks: int,
+    device_str: str,
+    mcts_simulations: int,
+    mcts_batch: int,
+    max_moves: int,
+    opponent: str,
+    collect_diag: bool,
+    no_legal_sample_cap: int,
+) -> None:
+    global _EV_MODEL, _EV_DEVICE, _EV_MCTS_SIM, _EV_MCTS_BATCH, _EV_MAX_MOVES, _EV_OPPONENT, _EV_COLLECT_DIAG, _EV_NOLEGAL_SAMPLE_CAP
+
+    dev: Any = "cpu"
+    try:
+        if str(device_str).startswith("cuda") and torch.cuda.is_available():
+            dev = torch.device("cuda")
+        else:
+            dev = "cpu"
+    except Exception:
+        dev = "cpu"
+    _EV_DEVICE = dev
+
+    m = PolicyValueNet(
+        input_size=int(input_size),
+        action_size=int(action_size),
+        width=int(width),
+        n_blocks=int(res_blocks),
+    )
+    buf = io.BytesIO(model_bytes)
+    try:
+        state = torch.load(buf, map_location="cpu", weights_only=True)  # type: ignore[call-arg]
+    except TypeError:
+        state = torch.load(buf, map_location="cpu")
+
+    try:
+        m.load_state_dict(state)
+    except Exception:
+        stripped = {}
+        for k, v in state.items():
+            if isinstance(k, str) and k.startswith("_orig_mod."):
+                stripped[k[len("_orig_mod."):]] = v
+            else:
+                stripped[k] = v
+        m.load_state_dict(stripped, strict=False)
+
+    _EV_MODEL = m.to(dev).eval()
+    _EV_MCTS_SIM = int(mcts_simulations)
+    _EV_MCTS_BATCH = int(max(1, mcts_batch))
+    _EV_MAX_MOVES = int(max(1, max_moves))
+    _EV_OPPONENT = str(opponent)
+    _EV_COLLECT_DIAG = bool(collect_diag)
+    _EV_NOLEGAL_SAMPLE_CAP = int(max(0, no_legal_sample_cap))
+
+
+def _eval_game_once(
+    model: PolicyValueNet,
+    *,
+    game_index: int,
+    seed: Optional[int],
+    opponent: str,
+    mcts_simulations: int,
+    mcts_batch: int,
+    max_moves: int,
+    device: Any,
+    collect_diag: bool,
+    no_legal_sample_cap: int,
+) -> Dict[str, Any]:
+    _set_all_seeds(seed)
+    state = setup_game(num_players=2)
+    state.log_no_legal = False
+
+    mcts = AlphaZeroMCTS(model, device=device, n_simulations=int(mcts_simulations), mcts_batch=int(mcts_batch))
+    my_index = int(game_index) % 2
+
+    move_count = 0
+    consecutive_passes = 0
+    ended_by_pass = False
+    no_legal_count = 0
+    no_legal_samples: List[Dict[str, Any]] = []
+    diag = _new_eval_policy_diag() if collect_diag else _new_eval_policy_diag()
+
+    while (not state.is_terminal) and (move_count < int(max_moves)):
+        legal = state.get_legal_actions()
+        if not legal:
+            no_legal_count += 1
+            if len(no_legal_samples) < int(no_legal_sample_cap):
+                snap = _snapshot_no_legal_state(state)
+                snap["game"] = int(game_index) + 1
+                snap["move"] = int(move_count)
+                no_legal_samples.append(snap)
+            state.current_player = (state.current_player + 1) % len(state.players)
+            consecutive_passes += 1
+            mcts.reset_root()
+            if consecutive_passes >= len(state.players):
+                ended_by_pass = True
+                break
+            continue
+
+        played_a_idx: Optional[int] = None
+        if state.current_player == my_index:
+            pi, a_idx = mcts.run(state, temperature=0.0)
+            if collect_diag:
+                _accum_eval_policy_diag(diag, pi, np.array(legal_actions_mask(state), dtype=np.float32))
+            if a_idx == -1:
+                a = random.choice(legal)
+                played_a_idx = None
+            else:
+                a = index_to_action(a_idx, state)
+                best_ret = mcts.get_best_tokens_returned(a_idx)
+                if best_ret is not None and hasattr(a, "tokens_returned"):
+                    a.tokens_returned = best_ret
+                played_a_idx = a_idx
+        else:
+            if opponent == "greedy":
+                a = _greedy_action(state)
+            else:
+                a = random.choice(legal)
+            played_a_idx = None
+
+        state = state.apply_action(a)
+        state.log_no_legal = False
+        move_count += 1
+        consecutive_passes = 0
+
+        if played_a_idx is not None:
+            try:
+                mcts.reuse_after_play(played_a_idx)
+            except Exception:
+                mcts.reset_root()
+        else:
+            mcts.reset_root()
+
+    winner_idx = _resolve_winner_after_pass(state, ended_by_pass)
+    my_pts = state.players[my_index].points
+    opp_pts = state.players[1 - my_index].points
+
+    return {
+        "win": int(winner_idx == my_index),
+        "margin": float(my_pts - opp_pts),
+        "length": float(move_count),
+        "diag": diag if collect_diag else _new_eval_policy_diag(),
+        "no_legal_count": int(no_legal_count),
+        "no_legal_samples": no_legal_samples,
+    }
+
+
+def _ev_run(args: Tuple[int, Optional[int]]) -> Dict[str, Any]:
+    game_index, seed = args
+    assert _EV_MODEL is not None
+    return _eval_game_once(
+        _EV_MODEL,
+        game_index=int(game_index),
+        seed=seed,
+        opponent=_EV_OPPONENT,
+        mcts_simulations=int(_EV_MCTS_SIM),
+        mcts_batch=int(_EV_MCTS_BATCH),
+        max_moves=int(_EV_MAX_MOVES),
+        device=_EV_DEVICE,
+        collect_diag=bool(_EV_COLLECT_DIAG),
+        no_legal_sample_cap=int(_EV_NOLEGAL_SAMPLE_CAP),
+    )
+
+
+def _run_eval_games(
+    model: PolicyValueNet,
+    *,
+    games: int,
+    mcts_simulations: int,
+    device: Any,
+    mcts_batch: int,
+    max_moves: int,
+    opponent: str,
+    collect_diag: bool,
+    eval_workers: int,
+    progress_tag: str,
+    no_legal_sample_cap: int,
+) -> Tuple[int, List[float], List[float], Dict[str, float], int, List[Dict[str, Any]]]:
+    games_i = int(max(0, games))
+    if games_i <= 0:
+        return 0, [], [], _new_eval_policy_diag(), 0, []
+
+    wins = 0
+    margins: List[float] = []
+    lengths: List[float] = []
+    diag_parts: List[Dict[str, float]] = []
+    no_legal_count = 0
+    no_legal_samples: List[Dict[str, Any]] = []
+
+    interval = max(1, games_i // 10)
+    base_seed = random.randint(0, 2**31 - 1)
+    sample_cap = int(max(0, no_legal_sample_cap))
+
+    req_workers = int(eval_workers)
+    if req_workers <= 0:
+        req_workers = min(max(1, (os.cpu_count() or 1)), games_i, 8)
+    req_workers = max(1, req_workers)
+    use_parallel = req_workers > 1 and games_i > 1
+
+    if use_parallel:
+        model_sd_cpu = _model_state_dict_cpu(model)
+        fallback_width = int(getattr(model, "width", 512))
+        try:
+            fallback_blocks = int(len(getattr(model, "blocks")))
+        except Exception:
+            fallback_blocks = 4
+        width, res_blocks = _infer_model_arch_from_state_dict(model_sd_cpu, fallback_width, fallback_blocks)
+        input_size = int(getattr(model, "input_size", len(flatten_game_state(setup_game(num_players=2)))))
+        action_size = int(getattr(model, "action_size", 43))
+
+        payload = io.BytesIO()
+        torch.save(model_sd_cpu, payload)
+        model_bytes = payload.getvalue()
+        tasks = [(g, base_seed + g) for g in range(games_i)]
+
+        # Keep worker device on CPU for portability/stability under spawn.
+        worker_device_str = "cpu"
+        print(f"[{progress_tag}] Parallel eval workers={req_workers} device={worker_device_str}")
+        try:
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(
+                processes=req_workers,
+                initializer=_ev_init,
+                initargs=(
+                    model_bytes,
+                    input_size,
+                    action_size,
+                    width,
+                    res_blocks,
+                    worker_device_str,
+                    int(mcts_simulations),
+                    int(max(1, mcts_batch)),
+                    int(max(1, max_moves)),
+                    str(opponent),
+                    bool(collect_diag),
+                    int(sample_cap),
+                ),
+            ) as pool:
+                for done, out in enumerate(pool.imap(_ev_run, tasks, chunksize=1), start=1):
+                    wins += int(out.get("win", 0))
+                    margins.append(float(out.get("margin", 0.0)))
+                    lengths.append(float(out.get("length", 0.0)))
+                    if collect_diag:
+                        diag_parts.append(out.get("diag", _new_eval_policy_diag()))
+                    no_legal_count += int(out.get("no_legal_count", 0))
+                    for snap in out.get("no_legal_samples", []):
+                        if len(no_legal_samples) < sample_cap:
+                            no_legal_samples.append(snap)
+                    if (done % interval == 0) or (done == games_i):
+                        print(f"[{progress_tag}] {done}/{games_i} games done")
+        except Exception as e:
+            print(f"[{progress_tag}] Parallel eval unavailable ({e}); falling back to sequential")
+            use_parallel = False
+
+    if not use_parallel:
+        for g in range(games_i):
+            out = _eval_game_once(
+                model,
+                game_index=g,
+                seed=base_seed + g,
+                opponent=str(opponent),
+                mcts_simulations=int(mcts_simulations),
+                mcts_batch=int(max(1, mcts_batch)),
+                max_moves=int(max(1, max_moves)),
+                device=device,
+                collect_diag=bool(collect_diag),
+                no_legal_sample_cap=int(sample_cap),
+            )
+            wins += int(out.get("win", 0))
+            margins.append(float(out.get("margin", 0.0)))
+            lengths.append(float(out.get("length", 0.0)))
+            if collect_diag:
+                diag_parts.append(out.get("diag", _new_eval_policy_diag()))
+            no_legal_count += int(out.get("no_legal_count", 0))
+            for snap in out.get("no_legal_samples", []):
+                if len(no_legal_samples) < sample_cap:
+                    no_legal_samples.append(snap)
+            if ((g + 1) % interval == 0) or (g + 1 == games_i):
+                print(f"[{progress_tag}] {g+1}/{games_i} games done")
+
+    if no_legal_count > 0:
+        print(f"[{progress_tag}NoLegal] count={no_legal_count} sampled={len(no_legal_samples)}")
+        for snap in no_legal_samples:
+            print(
+                f"[{progress_tag}NoLegalSample] game={snap.get('game')} move={snap.get('move')} "
+                f"p={snap.get('p')} reserved={snap.get('reserved')} can_reserve={snap.get('can_reserve')} "
+                f"board={snap.get('board')} deck={snap.get('deck')}"
+            )
+
+    diag = _merge_eval_policy_diag(diag_parts) if collect_diag else _new_eval_policy_diag()
+    return wins, margins, lengths, diag, no_legal_count, no_legal_samples
+
+
 def evaluate_vs_random(
     model: PolicyValueNet,
     games: int = 4,
@@ -1895,77 +2300,23 @@ def evaluate_vs_random(
     mcts_batch: int = 16,
     max_moves: int = 250,
     return_diagnostics: bool = False,
+    eval_workers: int = 0,
+    no_legal_sample_cap: int = 2,
 ):
-    wins = 0
-    diag = _new_eval_policy_diag()
-    for g in range(games):
-        state = setup_game(num_players=2)
-        mcts = AlphaZeroMCTS(model, device=device, n_simulations=mcts_simulations, mcts_batch=mcts_batch)
-        # Alternate who starts
-        my_index = g % 2
-        move_count = 0
-        consecutive_passes = 0
-        ended_by_pass = False
-        while not state.is_terminal:
-            legal = state.get_legal_actions()
-            if not legal:
-                state.current_player = (state.current_player + 1) % len(state.players)
-                consecutive_passes += 1
-                mcts.reset_root()
-                # Break stalemates where neither player has legal moves
-                if consecutive_passes >= len(state.players):
-                    ended_by_pass = True
-                    break
-                if move_count >= max_moves:
-                    break
-                continue
-            played_a_idx: Optional[int] = None
-            if state.current_player == my_index:
-                pi, a_idx = mcts.run(state, temperature=0.0)  # argmax over visits
-                _accum_eval_policy_diag(diag, pi, np.array(legal_actions_mask(state), dtype=np.float32))
-                if a_idx == -1:
-                    # fallback to random legal
-                    a = random.choice(legal)
-                    played_a_idx = None
-                else:
-                    a = index_to_action(a_idx, state)
-                    # Apply most-visited return variant for this base action if any
-                    best_ret = mcts.get_best_tokens_returned(a_idx)
-                    if best_ret is not None and hasattr(a, "tokens_returned"):
-                        a.tokens_returned = best_ret
-                    played_a_idx = a_idx
-            else:
-                a = random.choice(legal)
-                played_a_idx = None
-            state = state.apply_action(a)
-            move_count += 1
-            consecutive_passes = 0
-            if played_a_idx is not None:
-                try:
-                    mcts.reuse_after_play(played_a_idx)
-                except Exception:
-                    mcts.reset_root()
-            else:
-                # Opponent/random move or unencodable action -> tree is stale.
-                mcts.reset_root()
-        winner_idx = state.winner
-        if winner_idx is None and ended_by_pass:
-            # Provisional winner on pass-break only
-            max_pts = max(p.points for p in state.players)
-            candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
-            if len(candidates) == 1:
-                winner_idx = candidates[0]
-            else:
-                fewest_cards = min(len(state.players[i].cards) for i in candidates)
-                tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
-                winner_idx = tied[0] if len(tied) == 1 else None
-        if winner_idx == my_index:
-            wins += 1
-        # Lightweight eval progress
-        interval = max(1, games // 10)
-        if ((g + 1) % interval == 0) or (g + 1 == games):
-            print(f"[Eval] {g+1}/{games} games done")
-    wr = wins / games if games > 0 else 0.0
+    wins, _margins, _lengths, diag, _nl_count, _nl_samples = _run_eval_games(
+        model,
+        games=int(games),
+        mcts_simulations=int(mcts_simulations),
+        device=device,
+        mcts_batch=int(max(1, mcts_batch)),
+        max_moves=int(max(1, max_moves)),
+        opponent="random",
+        collect_diag=bool(return_diagnostics),
+        eval_workers=int(eval_workers),
+        progress_tag="Eval",
+        no_legal_sample_cap=int(no_legal_sample_cap),
+    )
+    wr = wins / int(games) if int(games) > 0 else 0.0
     if return_diagnostics:
         return wr, _finalize_eval_policy_diag(diag)
     return wr
@@ -2037,75 +2388,23 @@ def evaluate_vs_greedy(
     mcts_batch: int = 16,
     max_moves: int = 250,
     return_diagnostics: bool = False,
+    eval_workers: int = 0,
+    no_legal_sample_cap: int = 2,
 ):
-    wins = 0
-    margins = []
-    lengths = []
-    diag = _new_eval_policy_diag()
-    for g in range(games):
-        state = setup_game(num_players=2)
-        mcts = AlphaZeroMCTS(model, device=device, n_simulations=mcts_simulations, mcts_batch=mcts_batch)
-        my_index = g % 2
-        move_count = 0
-        consecutive_passes = 0
-        ended_by_pass = False
-        while not state.is_terminal and move_count < max_moves:
-            legal = state.get_legal_actions()
-            if not legal:
-                state.current_player = (state.current_player + 1) % len(state.players)
-                consecutive_passes += 1
-                mcts.reset_root()
-                if consecutive_passes >= len(state.players):
-                    ended_by_pass = True
-                    break
-                continue
-            played_a_idx: Optional[int] = None
-            if state.current_player == my_index:
-                pi, a_idx = mcts.run(state, temperature=0.0)
-                _accum_eval_policy_diag(diag, pi, np.array(legal_actions_mask(state), dtype=np.float32))
-                if a_idx == -1:
-                    a = legal[0]
-                    played_a_idx = None
-                else:
-                    a = index_to_action(a_idx, state)
-                    best_ret = mcts.get_best_tokens_returned(a_idx)
-                    if best_ret is not None and hasattr(a, "tokens_returned"):
-                        a.tokens_returned = best_ret
-                    played_a_idx = a_idx
-            else:
-                a = _greedy_action(state)
-            state = state.apply_action(a)
-            move_count += 1
-            consecutive_passes = 0
-            if played_a_idx is not None:
-                try:
-                    mcts.reuse_after_play(played_a_idx)
-                except Exception:
-                    mcts.reset_root()
-            else:
-                mcts.reset_root()
-        lengths.append(move_count)
-        my_pts = state.players[my_index].points
-        opp_pts = state.players[1 - my_index].points
-        margins.append(my_pts - opp_pts)
-        winner_idx = state.winner
-        if winner_idx is None and ended_by_pass:
-            # Provisional winner on pass-break only
-            max_pts = max(p.points for p in state.players)
-            candidates = [i for i, p in enumerate(state.players) if p.points == max_pts]
-            if len(candidates) == 1:
-                winner_idx = candidates[0]
-            else:
-                fewest_cards = min(len(state.players[i].cards) for i in candidates)
-                tied = [i for i in candidates if len(state.players[i].cards) == fewest_cards]
-                winner_idx = tied[0] if len(tied) == 1 else None
-        if winner_idx == my_index:
-            wins += 1
-        # progress
-        interval = max(1, games // 10)
-        if ((g + 1) % interval == 0) or (g + 1 == games):
-            print(f"[EvalGreedy] {g+1}/{games} games done")
-    win_rate = wins / games if games > 0 else 0.0
+    wins, margins, lengths, diag, _nl_count, _nl_samples = _run_eval_games(
+        model,
+        games=int(games),
+        mcts_simulations=int(mcts_simulations),
+        device=device,
+        mcts_batch=int(max(1, mcts_batch)),
+        max_moves=int(max(1, max_moves)),
+        opponent="greedy",
+        collect_diag=bool(return_diagnostics),
+        eval_workers=int(eval_workers),
+        progress_tag="EvalGreedy",
+        no_legal_sample_cap=int(no_legal_sample_cap),
+    )
+    win_rate = wins / int(games) if int(games) > 0 else 0.0
     avg_margin = float(np.mean(margins)) if margins else 0.0
     avg_len = float(np.mean(lengths)) if lengths else 0.0
     if return_diagnostics:
@@ -2197,6 +2496,10 @@ def az_train(
     # Parallel self-play
     selfplay_workers: int = 0,
     selfplay_device: Optional[str] = None,
+    # Eval controls
+    eval_mcts_batch: Optional[int] = None,
+    eval_workers: int = 0,
+    eval_no_legal_sample_cap: int = 2,
     # Eval diagnostics: summarize policy behavior by action family and legality.
     log_policy_diagnostics: bool = True,
 ):
@@ -2774,6 +3077,8 @@ def az_train(
         )
 
         # Evaluate vs random (and greedy for extra signal)
+        eff_eval_batch = int(eval_mcts_batch) if eval_mcts_batch is not None else int(mcts_batch)
+        eff_eval_batch = max(1, eff_eval_batch)
         print(f"[Iter {it}] Eval: {eval_games} games vs random")
         if log_policy_diagnostics:
             win_rate, _diag_rand = evaluate_vs_random(
@@ -2781,8 +3086,10 @@ def az_train(
                 games=eval_games,
                 mcts_simulations=mcts_simulations,  # full sims for eval
                 device=device,
-                mcts_batch=mcts_batch,
+                mcts_batch=eff_eval_batch,
                 return_diagnostics=True,
+                eval_workers=eval_workers,
+                no_legal_sample_cap=eval_no_legal_sample_cap,
             )
         else:
             win_rate = evaluate_vs_random(
@@ -2790,7 +3097,9 @@ def az_train(
                 games=eval_games,
                 mcts_simulations=mcts_simulations,  # full sims for eval
                 device=device,
-                mcts_batch=mcts_batch,
+                mcts_batch=eff_eval_batch,
+                eval_workers=eval_workers,
+                no_legal_sample_cap=eval_no_legal_sample_cap,
             )
         print(f"[Iter {it}] Eval: {eval_games} games vs greedy")
         if log_policy_diagnostics:
@@ -2799,8 +3108,10 @@ def az_train(
                 games=eval_games,
                 mcts_simulations=mcts_simulations,  # full sims for eval
                 device=device,
-                mcts_batch=mcts_batch,
+                mcts_batch=eff_eval_batch,
                 return_diagnostics=True,
+                eval_workers=eval_workers,
+                no_legal_sample_cap=eval_no_legal_sample_cap,
             )
         else:
             win_g, margin_g, len_g = evaluate_vs_greedy(
@@ -2808,7 +3119,9 @@ def az_train(
                 games=eval_games,
                 mcts_simulations=mcts_simulations,  # full sims for eval
                 device=device,
-                mcts_batch=mcts_batch,
+                mcts_batch=eff_eval_batch,
+                eval_workers=eval_workers,
+                no_legal_sample_cap=eval_no_legal_sample_cap,
             )
             diag_g = _finalize_eval_policy_diag(_new_eval_policy_diag())
 
@@ -2996,14 +3309,18 @@ def az_train(
                     games=int(big_eval_games),
                     mcts_simulations=mcts_simulations,
                     device=device,
-                    mcts_batch=mcts_batch,
+                    mcts_batch=eff_eval_batch,
+                    eval_workers=eval_workers,
+                    no_legal_sample_cap=eval_no_legal_sample_cap,
                 )
                 big_wg, big_margin, big_len = evaluate_vs_greedy(
                     model,
                     games=int(big_eval_games),
                     mcts_simulations=mcts_simulations,
                     device=device,
-                    mcts_batch=mcts_batch,
+                    mcts_batch=eff_eval_batch,
+                    eval_workers=eval_workers,
+                    no_legal_sample_cap=eval_no_legal_sample_cap,
                 )
                 with open(big_eval_path, "a", newline="") as bf:
                     bw = csv.writer(bf)
